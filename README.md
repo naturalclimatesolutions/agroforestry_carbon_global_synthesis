@@ -1,4 +1,4 @@
-# Agroforestry carbon analysis code
+# Agroforestry carbon: global synthesis
 
 Analysis code supporting:
 
@@ -95,7 +95,7 @@ Other files in `output/` are supporting results (e.g., C-R fits by category, rat
 
 ## Reproducing the analysis
 
-1. Clone this repository and open `agroforestry_carbon_analysis_code.Rproj`
+1. Clone this repository and open `agroforestry_carbon_global_synthesis.Rproj`
    in RStudio (or set the working directory to the repository root; all
    paths are resolved with `here::here()`). The GROA-AF dataset is included
    in `data/groa_af/` (see [data/README.md](data/README.md)).
