@@ -1,0 +1,1327 @@
+---
+title: "09 - Random forest models of AGC and soil carbon"
+output: html_document
+params:
+  use_cache: false
+---
+
+**Purpose.** Fits random forest regression models (tidymodels + ranger) of aboveground carbon stock (AGC) and soil organic carbon (SOC; by default the change from baseline, `use_soc_delta = T`) as functions of site, climate, management and prior land-use covariates. Rows whose site has no usable coordinates (and hence no ecoregion) are excluded. Missing values in the management and species-trait binaries are coded as an explicit "missing" category (one-hot encoded, so each variable contributes `= True`, `= False` and `= Missing` features) rather than imputed; remaining numeric predictors are median-imputed. Hyperparameters are tuned by cross-validation and performance is evaluated on a held-out test set. The fitted models are then interpreted with SHAP values and interactions (TreeSHAP), partial dependence plots (PDP) for the top predictors ranked by grouped mean |SHAP| (indicator columns summed per observation), and profiling of extreme predictions.
+
+**Inputs.**
+
+- `output/data/{agc,soc}_by_plot_and_age_w_covars_drop_outliers.xlsx` (from `04_drop_outliers.Rmd`)
+- `output/tables/bivariate_model_summaries.xlsx` (from `05_bivariate_analysis.Rmd`), used to select the candidate predictors
+- `data/groa_af/sites.csv` (GROA-AF dataset) and `output/intermediate/s3_by_plot.xlsx` (from `01`), used to identify rows whose site has coordinates
+
+**Outputs.**
+
+- Model cache: `output/intermediate/rf_model/{fit_list,test_data_list,perf_list}.rds`
+- SHAP cache: `output/intermediate/shap_objects.rds`
+- Tables (`output/tables/`): `rf_model_performance.csv` (original split), `rf_model_performance_repeated_splits.csv` and `rf_model_performance_summary.csv` (50 random splits; reported in the paper), `rf_shap_top_interaction_pairs.csv`
+- Figures (`output/figures/`): `rf_pdp_top6.png`, `rf_pdp_top9_agc.png`, `rf_pdp_top9_soc.png`, `rf_model_diagnostics.png`, `rf_shap_interaction_heatmap.png`, `rf_shap_beeswarm.png`
+
+**Caching and run time.** Model training (`run-rf`: 40-point grid x 10-fold CV x 2 pools, 500 trees each) is the most expensive step, followed by the SHAP interaction values (`shap-compute`) and the PDP section (which uses the SHAP ranking). With the `use_cache` YAML parameter `false` (the default) everything is computed and the fitted models and SHAP values are cached to `output/intermediate/`. Setting `use_cache: true` (or `Rscript run_all.R --use-cache`) skips training and SHAP computation and reloads the cached results (`load-model`, `shap-load`), which is useful for re-making tables and figures.
+
+```{r setup}
+library(here)
+library(tidyverse)
+library(openxlsx)
+library(tidymodels)
+library(ranger)
+library(patchwork)
+library(cowplot)     # PDP / diagnostic panel assembly
+library(treeshap)    # SHAP values and interactions
+library(ggbeeswarm)  # SHAP beeswarm plot
+
+set.seed(7381)
+```
+
+---
+
+## Configuration
+
+```{r config}
+# Set the use_cache param (YAML header) to TRUE to skip model training and SHAP
+# computation and reuse the cached results in output/intermediate/ (requires
+# one prior run with FALSE)
+use_cache <- isTRUE(params$use_cache)
+
+af_cats <- c('AC', 'BP', 'COP', 'FAL', 'FOD', 'MS', 'OTH_AF', 'PAR',
+             'RB', 'ROT', 'SA', 'SP', 'SPC', 'TMC', 'WL')
+
+c_data_names_rf <- c("agc", "soc")
+
+only_bivariate_sig_vars <- F
+
+# Select whether to use SOC stock or delta from baseline
+use_soc_delta <- T
+
+# 0/1 binaries with many NAs: recoded to "false" / "true" / "missing" so missingness
+# is an explicit category rather than imputed
+explicit_missing_bin_vars <- c(
+  "pruning", "weed_control", "tillage", "grazing", "burning", "litter_management",
+  "pest_control", "fertilizer", "irrigation",
+  "n_fix_bin", "myco_fungi_am", "myco_fungi_ecm", "freezing_exposed"
+)
+# Exempt from step_nzv / step_other (ecoregion: keep all levels, incl. rare Boreal/polar)
+no_filter_vars <- c(explicit_missing_bin_vars, "ecoregion")
+
+```
+
+---
+
+## Label lookups
+
+```{r labels}
+
+# AF category level labels
+af_cat_labels <- c(
+  'AC'      = "Alley cropping",
+  'BP'      = "Boundary planting",
+  'COP'     = "Coppice",
+  'FAL'     = "Fallows",
+  'FOD'     = "Fodder bank",
+  'MS'      = "Multistrata",
+  'OTH_AF'  = "Other Agroforestry",
+  'PAR'     = "Parklands",
+  'RB'      = "Riparian Buffer",
+  'ROT'     = "Rotational",
+  'SA'      = "Silvoarable",
+  'SP'      = "Silvopasture",
+  'SPC'     = "Shaded perennial",
+  'TMC'     = "Tree monocrop",
+  'WL'      = "Woodlot"
+)
+
+# Audebert recoded region levels
+audebert_levels <- c(
+  "Temperate wet",
+  "Tropical/subtropical wet",
+  "Temperate dry",
+  "Tropical/subtropical dry",
+  "Boreal/polar"
+)
+
+# Labels for predictors, and for the parents of dummy columns
+predictor_label_lkup <- tribble(
+  ~Variable,                ~Label,
+  "af_cat",                 "Agroforestry category",
+  "ecoregion",    "Ecoregion",
+  "age",                    "Age (years)",
+  "trees_per_ha",           "Trees per hectare",
+  "masl",                   "Elevation (m)",
+  "map",                    "Mean annual precipitation (mm)",
+  "mat",                    "Mean annual temperature (°C)",
+  "sand_pct",               "Sand (%)",
+  "silt_pct",               "Silt (%)",
+  "clay_pct",               "Clay (%)",
+  "pruning",                "Management: Pruning",
+  "weed_control",           "Management: Weed control",
+  "tillage",                "Management: Tillage",
+  "grazing",                "Management: Grazers",
+  "burning",                "Management: Burning",
+  "litter_management",                 "Management: Litter",
+  "pest_control",           "Management: Pest control",
+  "fertilizer",             "Management: Fertilizer",
+  "irrigation",             "Management: Irrigation",
+  "avg_veg_height_m",       "Avg. vegetation height (m)",
+  "avg_leaf_area_mm2_mg",   "Specific leaf area (mm\u00B2/mg)",
+  "n_fix_bin",              "Nitrogen fixing tree",
+  "myco_fungi_am",          "Mycorrhizal fungi: AM",
+  "myco_fungi_ecm",         "Mycorrhizal fungi: ECM",
+  "freezing_exposed",       "Tolerance to freezing",
+  "af_diversity",              "Tree species diversity",
+  "prior_FIRE",             "Prior land: Fire",
+  "prior_TMC",              "Prior land: Tree monoculture",
+  "prior_FOR",              "Prior land: Forest",
+  "prior_GRA",              "Prior land: Grassland",
+  "prior_FALLOW",           "Prior land: Fallow",
+  "prior_CROP",             "Prior land: Cropland",
+  "prior_DEGRADED",         "Prior land: Degraded",
+  "prior_TIMBER",           "Prior land: Timber",
+  "prior_SAV",              "Prior land: Savanna",
+  "prior_SAND",             "Prior land: Sand",
+  "prior_AF",               "Prior land: Agroforestry",
+  "prior_NATURAL",          "Prior land: Natural",
+  "prior_SP",               "Prior land: Silvopastoral",
+  "prior_PARK",             "Prior land: Parkland",
+  "prior_SNR",              "Prior land: Shifting natural regen.",
+  "prior_unknown",          "Prior land: Unknown",
+  "ctrl_CROP",              "Control: Cropland",
+  "ctrl_GRA",               "Control: Grassland",
+  "ctrl_OTH_CTR",           "Control: Other",
+  "ctrl_chrono",            "Control: Chronosequence",
+  "prior",                  "Prior land use",
+  "ctrl",                   "Control land use"
+)
+
+# Display labels for the carbon pools
+pool_labels <- c(agc = "AGC", soc = "\u0394SOC")
+
+# Per-level label map for dummy-encoded categorical variables.
+# Each level gets its own label (used in the SHAP outputs).
+# "af_cat_other" is a synthetic level created by step_other() for infrequent categories.
+# parent_var is used to roll dummy levels back up to their variable.
+bin_level_labels <- c(false = "False", true = "True", missing = "Missing")
+
+dummy_label_map <- bind_rows(
+  tibble(
+    parent_var = "af_cat",
+    dummy_col  = c(paste0("af_cat_", names(af_cat_labels)), "af_cat_other"),
+    label      = c(paste0("AF category: ", af_cat_labels),   "AF category: Rare categories (pooled)")
+  ),
+  tibble(
+    parent_var = "ecoregion",
+    dummy_col  = paste0("ecoregion_", make.names(audebert_levels)),
+    label      = paste0("Ecoregion: ", audebert_levels)
+  ),
+  # e.g. tillage_missing -> "Management: Tillage = Missing"
+  expand_grid(parent_var = explicit_missing_bin_vars, level = names(bin_level_labels)) |>
+    left_join(predictor_label_lkup, by = c("parent_var" = "Variable")) |>
+    transmute(
+      parent_var,
+      dummy_col = paste0(parent_var, "_", level),
+      label     = paste0(Label, " = ", bin_level_labels[level])
+    )
+)
+
+# Display labels for categorical levels on PDP axes
+level_display_labels <- c(bin_level_labels, af_cat_labels, rare_pooled = "Rare cats (pooled)")
+
+```
+
+---
+
+## Load bivariate model summaries (once, before loop)
+
+Predictor candidates for each pool are taken from the bivariate model summaries written by notebook 06.
+
+```{r load-bivar}
+
+bivar_sum_file_path <- here("output", "tables", "bivariate_model_summaries.xlsx")
+bms_wb      <- loadWorkbook(bivar_sum_file_path)
+sheet_names <- getSheetNames(bivar_sum_file_path)
+
+```
+
+---
+
+## Sites with coordinates
+
+Rows are kept only if their site has usable coordinates: a bounding-box centroid and an ecoregion in the sites table of the GROA-AF dataset (sites whose centroid is far outside the Audebert zones have no ecoregion). A row's site is that of its first plot found in `s3_by_plot`, the same rule 03a/03b use to join site covariates.
+
+```{r site-coords}
+
+sites_with_coords <- read.csv(here("data", "groa_af", "sites.csv"), na.strings = "", fileEncoding = "UTF-8-BOM",
+                              colClasses = c(site_id = "character")) |>
+  filter(!is.na(lat), !is.na(audebert_ecoregion_5class)) |>
+  pull(site_id) |>
+  as.character()
+
+plot_site <- read.xlsx(here("output", "intermediate", "s3_by_plot.xlsx")) |>
+  transmute(ssp_id, site_id = as.character(site_id))
+
+row_site <- function(ssp_ids) {
+  map_chr(str_split(ssp_ids, ", "), \(v) {
+    s <- plot_site$site_id[match(trimws(v), plot_site$ssp_id)]
+    s <- s[!is.na(s)]
+    if (length(s) > 0) s[1] else NA_character_
+  })
+}
+
+```
+
+---
+
+## Run RF pipeline for each carbon pool
+
+For each pool: load data, select predictors from the bivariate summaries, make a stratified 80/20 train/test split, tune `mtry` and `min_n` over a 40-point Latin hypercube grid with 10-fold CV (the most expensive step in the notebook), fit the final model on the training set, and evaluate it on the test set.
+
+```{r run-rf, eval = !use_cache}
+
+reg_metrics <- metric_set(rmse, rsq, mae)
+
+perf_list       <- list()
+fit_list        <- list()
+test_data_list  <- list()
+
+for (c_data_name in c_data_names_rf) {
+
+  outcome <- if (grepl("change", c_data_name)) "c_t_ha_yr" else "c_t_ha"
+
+  cat("\n====", toupper(c_data_name), "====\n")
+
+  # --- Load data ---
+  df <- read.xlsx(paste0(here("output", "data"), "/", c_data_name,
+                         "_by_plot_and_age_w_covars_drop_outliers.xlsx")) |>
+    filter(af_cat %in% af_cats) |>
+    # Binary dummy columns use 1/NA encoding; replace NA with 0 so step_impute_median
+    # does not incorrectly impute absent categories as present
+    mutate(across(
+      (starts_with("prior_") | starts_with("ctrl_") | starts_with("soil_tex_")) & where(is.numeric),
+      ~replace_na(., 0)
+    ))
+  
+  
+  # Drop rows whose site has no usable coordinates (see site-coords)
+  has_coords <- row_site(df$ssp_id) %in% sites_with_coords
+  cat("Dropping", sum(!has_coords), "rows without site coordinates\n")
+  df <- df[has_coords, ]
+  if (anyNA(df$ecoregion)) {
+    stop(sum(is.na(df$ecoregion)), " rows have coordinates but no ecoregion; check 03a/03b joins")
+  }
+
+  # Explicit missing category instead of imputation
+  bad_bin <- keep(explicit_missing_bin_vars, \(v) v %in% names(df) && any(!df[[v]] %in% c(0, 1, NA)))
+  if (length(bad_bin) > 0) stop("Non-0/1 values in: ", paste(bad_bin, collapse = ", "))
+  df <- df |>
+    mutate(
+      across(any_of(explicit_missing_bin_vars),
+             \(x) case_when(x == 1 ~ "true", x == 0 ~ "false", is.na(x) ~ "missing"))
+    )
+
+  # Set soc c_t_ha as c_t_ha_delta if selected
+  if (use_soc_delta && c_data_name == 'soc') {
+    df <- df %>%
+      mutate(c_t_ha = c_t_ha_delta) %>%
+      select(-c_t_ha_delta)
+  }
+  
+  
+  cat("n =", nrow(df), "\n")
+
+  # --- Identify bivariate-significant predictors ---
+  sig_var_ls <- list()
+  # 06 labels pools in c_pool as "AGC" / "\u0394SOC", not "agc" / "soc"
+  bms_pool <- pool_labels[[c_data_name]]
+
+  for (sheet_name in sheet_names) {
+    bms_df <- readWorkbook(bms_wb, sheet = sheet_name)
+
+    required_cols <- c("c_pool", "significance", "independent_var")
+    if (length(setdiff(required_cols, names(bms_df))) > 0) {
+      sig_var_ls[[sheet_name]] <- character(0)
+      next
+    }
+
+    sig <- ifelse(is.na(bms_df$significance), "", as.character(bms_df$significance))
+
+    keep_rows <- if (only_bivariate_sig_vars) {
+      (bms_df$c_pool == bms_pool) & grepl("\\*", sig)
+    } else {
+      bms_df$c_pool == bms_pool
+    }
+
+    # For prior_cat: extract category names, excluding the 'Full model' summary row
+    sig_var_ls[[sheet_name]] <- if (sheet_name == "prior_cat") {
+      cats <- bms_df$category[keep_rows]
+      cats[!cats %in% c("Full model", "unknown", NA)]
+    } else {
+      # Exclude 'Full model' summary rows if the category column exists
+      rows <- if ("category" %in% names(bms_df)) {
+        keep_rows & (is.na(bms_df$category) | bms_df$category != "Full model")
+      } else {
+        keep_rows
+      }
+      bms_df$independent_var[rows]
+    }
+  }
+
+  sig_var_ls[["bin_var"]]   <- str_replace(sig_var_ls[["bin_var"]], " = 1", "")
+  # Fail loudly if the pool label didn't match (would silently drop predictors)
+  if (length(sig_var_ls[["cont_var"]]) == 0 || length(sig_var_ls[["prior_cat"]]) == 0) {
+    stop("No predictors found for '", bms_pool, "' in ", bivar_sum_file_path,
+         "; check that c_pool labels in 05 match pool_labels here.")
+  }
+  sig_var_ls[["prior_cat"]] <- paste0("prior_", sig_var_ls[["prior_cat"]])
+
+  predictors <- unique(c(
+    "af_cat",
+    "ecoregion",
+    sig_var_ls[["cont_var"]],
+    sig_var_ls[["bin_var"]],
+    sig_var_ls[["prior_cat"]],
+    if (c_data_name == "soc") c("ctrl_CROP", "ctrl_GRA", "ctrl_OTH_CTR", "ctrl_chrono") else character(0)
+  ))
+  predictors <- setdiff(predictors, "depth_max")
+  predictors <- union(predictors, "prior_unknown")
+
+  cat("Predictors (", length(predictors), "):", paste(predictors, collapse = ", "), "\n")
+
+  # --- Train / test split and CV folds ---
+  set.seed(7381)
+  data_split <- initial_split(df, prop = 0.8, strata = outcome)
+  train_df   <- training(data_split)
+  test_df    <- testing(data_split)
+
+  set.seed(7381)
+  cv_folds <- vfold_cv(train_df, v = 10, strata = outcome)
+
+  cat("Train n:", nrow(train_df), " | Test n:", nrow(test_df), "\n")
+
+  # --- Recipe ---
+  base_formula <- as.formula(paste(outcome, "~", paste(predictors, collapse = " + ")))
+
+  # Explicit-missing variables are exempt from step_nzv / step_other, which would
+  # otherwise drop them (dominant "missing" level) or pool their rare levels.
+  # One-hot so every level (incl. "missing" and the af_cat reference) is a feature.
+  rf_recipe <- recipe(base_formula, data = train_df) |>
+    step_nzv(all_predictors(), -any_of(no_filter_vars)) |>
+    step_impute_median(all_numeric_predictors()) |>
+    step_impute_mode(all_nominal_predictors()) |>
+    step_other(all_nominal_predictors(), -any_of(no_filter_vars), threshold = 0.01) |>
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+    step_zv(all_predictors())
+
+  # --- Model spec ---
+  rf_spec <- rand_forest(
+    trees = 500,
+    mtry  = tune(),
+    min_n = tune()
+  ) |>
+    set_mode("regression") |>
+    set_engine("ranger")
+
+  # --- Workflow ---
+  wf_rf <- workflow() |>
+    add_recipe(rf_recipe) |>
+    add_model(rf_spec)
+
+  # --- Tune: Latin hypercube grid over mtry and min_n ---
+  prepped_cols <- prep(rf_recipe) |> bake(new_data = NULL) |> ncol() - 1L
+
+  rf_grid <- grid_latin_hypercube(
+    mtry(range = c(2L, max(2L, floor(prepped_cols / 2L)))),
+    min_n(),
+    size = 40
+  )
+
+  set.seed(7381)
+  rf_res <- tune_grid(
+    wf_rf,
+    resamples = cv_folds,
+    grid      = rf_grid,
+    metrics   = reg_metrics,
+    control   = control_grid(save_pred = TRUE)
+  )
+
+  rf_params <- select_best(rf_res, metric = "rmse")
+  cat("Best mtry:", rf_params$mtry, "| min_n:", rf_params$min_n, "\n")
+
+  # --- Finalize and fit on full training set ---
+  final_rf_wf  <- finalize_workflow(wf_rf, rf_params)
+  final_rf_fit <- fit(final_rf_wf, data = train_df)
+
+  # --- Evaluate on held-out test set ---
+  test_metrics <- predict(final_rf_fit, new_data = test_df) |>
+    bind_cols(test_df |> dplyr::select(all_of(outcome))) |>
+    reg_metrics(truth = !!rlang::sym(outcome), estimate = .pred) |>
+    pivot_wider(names_from = .metric, values_from = .estimate) |>
+    mutate(
+      c_pool = c_data_name,
+      mtry   = rf_params$mtry,
+      min_n  = rf_params$min_n
+    ) |>
+    dplyr::select(c_pool, rmse, rsq, mae, mtry, min_n)
+
+  # Store results
+  perf_list[[c_data_name]]      <- test_metrics
+  fit_list[[c_data_name]]        <- final_rf_fit
+  test_data_list[[c_data_name]]  <- list(train_df = train_df, df = test_df, outcome = outcome)
+
+}
+
+```
+
+---
+
+## Save model outputs
+
+Persist all objects needed by the downstream table and plot sections (the cache read back by `load-model`).
+
+```{r save-model, eval = !use_cache}
+
+dir.create(here("output", "intermediate", "rf_model"), showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(fit_list,        here("output", "intermediate", "rf_model", "fit_list.rds"))
+saveRDS(test_data_list,  here("output", "intermediate", "rf_model", "test_data_list.rds"))
+saveRDS(perf_list,       here("output", "intermediate", "rf_model", "perf_list.rds"))
+
+cat("Saved to output/intermediate/rf_model/\n")
+
+```
+
+---
+
+## Load model outputs
+
+Reload the cached model objects. When `use_cache = TRUE` this is where the analysis picks up; otherwise it simply reloads what `save-model` just wrote.
+
+```{r load-model}
+
+fit_list        <- readRDS(here("output", "intermediate", "rf_model", "fit_list.rds"))
+test_data_list  <- readRDS(here("output", "intermediate", "rf_model", "test_data_list.rds"))
+perf_list       <- readRDS(here("output", "intermediate", "rf_model", "perf_list.rds"))
+
+cat("Loaded from output/intermediate/rf_model/\n")
+
+```
+
+---
+
+## Model performance
+
+```{r performance}
+
+perf_tbl <- bind_rows(perf_list) |>
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+perf_tbl |>
+  mutate(c_pool = recode(c_pool, agc = "AGC", soc = "\u0394SOC"))
+
+write_csv(perf_tbl, here("output", "tables", "rf_model_performance.csv"))
+
+```
+
+## Performance across random train/test splits
+
+A single 80/20 split gives a noisy estimate of test performance, especially for ΔSOC. Each final model specification (tuned `mtry` and `min_n` fixed; recipe re-estimated on each training set) is refitted on 50 random 80/20 splits stratified on the outcome, and the test-set metrics are summarized. The paper reports these means. Hyperparameters were tuned once, on the original training set, so the estimates may be slightly optimistic. `num.threads` is fixed because ranger's results depend on it. Runs also with `use_cache` (about 4 minutes).
+
+```{r repeated-splits}
+
+n_splits <- 50
+reg_metrics <- metric_set(rmse, rsq, mae)
+set.seed(5126)
+split_seeds <- sample.int(1e6, n_splits)
+
+split_perf <- map_dfr(c("soc", "agc"), function(pool) {
+  td      <- test_data_list[[pool]]
+  outcome <- td$outcome
+  full_df <- bind_rows(td$train_df, td$df)
+  spec    <- extract_spec_parsnip(fit_list[[pool]]) |> set_engine("ranger", num.threads = 10)
+  wf      <- workflow() |> add_recipe(extract_preprocessor(fit_list[[pool]])) |> add_model(spec)
+  map_dfr(seq_along(split_seeds), function(i) {
+    set.seed(split_seeds[i])
+    sp <- initial_split(full_df, prop = 0.8, strata = all_of(outcome))
+    f  <- fit(wf, data = training(sp))
+    m  <- predict(f, new_data = testing(sp)) |>
+      bind_cols(testing(sp) |> dplyr::select(all_of(outcome))) |>
+      reg_metrics(truth = !!rlang::sym(outcome), estimate = .pred)
+    tibble(c_pool = pool, split = i, seed = split_seeds[i],
+           rmse = m$.estimate[m$.metric == "rmse"],
+           rsq  = m$.estimate[m$.metric == "rsq"],
+           mae  = m$.estimate[m$.metric == "mae"])
+  })
+})
+
+split_perf_summary <- split_perf |>
+  group_by(c_pool) |>
+  summarise(n_splits = n(),
+            across(c(rsq, rmse, mae), list(mean = mean, sd = sd, min = min, max = max)),
+            .groups = "drop") |>
+  arrange(c_pool)
+
+split_perf_summary |>
+  mutate(across(where(is.numeric) & !n_splits, ~ round(., 3)),
+         c_pool = recode(c_pool, agc = "AGC", soc = "\u0394SOC"))
+
+write_csv(split_perf, here("output", "tables", "rf_model_performance_repeated_splits.csv"))
+write_csv(split_perf_summary, here("output", "tables", "rf_model_performance_summary.csv"))
+
+```
+
+---
+
+## SHAP values and interactions
+
+TreeSHAP values for every training observation, plus pairwise SHAP interaction values for a random subsample of 75 observations (interactions are O(n * p^2) and are the most expensive step in this section). The result is cached to `output/intermediate/shap_objects.rds` (see `shap-save` and `shap-load` below).
+
+```{r shap-compute, eval = !use_cache}
+
+shap_list       <- list()
+shap_inter_list <- list()
+
+for (pool in c_data_names_rf) {
+
+  cat("\n=== SHAP:", toupper(pool), "===\n")
+
+  fit      <- fit_list[[pool]]
+  train_df <- test_data_list[[pool]]$train_df
+  outcome  <- test_data_list[[pool]]$outcome
+
+  # Bake training data through the fitted recipe to get the feature matrix
+  prepped <- extract_recipe(fit)
+  X_baked <- bake(prepped, new_data = train_df) |>
+    select(-all_of(outcome))
+
+  rf_engine <- extract_fit_engine(fit)
+  unified   <- ranger.unify(rf_engine, X_baked)
+
+  cat("Computing SHAP values (n =", nrow(X_baked), ")...\n")
+  shap_obj          <- treeshap(unified, X_baked, verbose = FALSE)
+  shap_list[[pool]] <- shap_obj
+
+  # Interactions are O(n * p^2) — subsample to keep tractable
+  n_inter <- min(75, nrow(X_baked))
+  set.seed(7381)
+  X_sub <- X_baked[sample(nrow(X_baked), n_inter), ]
+
+  cat("Computing SHAP interactions (n =", n_inter, ")...\n")
+  shap_inter_obj          <- treeshap(unified, X_sub, interactions = TRUE, verbose = FALSE)
+  shap_inter_list[[pool]] <- shap_inter_obj
+
+  cat("Done.\n")
+}
+
+```
+
+Cache the SHAP results (skipped when `use_cache = TRUE`).
+
+```{r shap-save, eval = !use_cache}
+saveRDS(
+  list(shap_list = shap_list, shap_inter_list = shap_inter_list),
+  file = here("output", "intermediate", "shap_objects.rds")
+)
+```
+
+```{r shap-load, eval = use_cache}
+# Load cached SHAP results (only when use_cache = TRUE).
+shap_cache       <- readRDS(here("output", "intermediate", "shap_objects.rds"))
+shap_list        <- shap_cache$shap_list
+shap_inter_list  <- shap_cache$shap_inter_list
+rm(shap_cache)
+```
+
+
+---
+
+## Predictor ranking by SHAP
+
+One score per predictor: for each observation, the SHAP values of a categorical predictor's indicator columns (including its "missing" level) are summed, and the mean absolute value of that sum is taken across observations. For continuous predictors this is simply the mean absolute SHAP value. This ranking selects the predictors shown in the PDP figures and the extreme-prediction profiles.
+
+```{r shap-rank}
+
+shap_rank <- map_dfr(c_data_names_rf, function(pool) {
+  shaps  <- as.data.frame(shap_list[[pool]]$shaps)
+  parent <- coalesce(dummy_label_map$parent_var[match(names(shaps), dummy_label_map$dummy_col)],
+                     names(shaps))
+  # SHAP values are additive, so a predictor's contribution to one prediction is
+  # the sum of its indicator columns; summing mean |SHAP| per column instead
+  # would double-count levels that partly cancel within an observation.
+  map_dbl(split(names(shaps), parent),
+          \(cols) mean(abs(rowSums(shaps[, cols, drop = FALSE])))) |>
+    enframe(name = "parent_var", value = "mean_abs_shap") |>
+    left_join(predictor_label_lkup, by = c("parent_var" = "Variable")) |>
+    transmute(c_pool = pool, parent_var, label = coalesce(Label, parent_var), mean_abs_shap) |>
+    arrange(desc(mean_abs_shap)) |>
+    mutate(rank = row_number())
+})
+
+shap_rank |> filter(rank <= 9)
+
+```
+
+Numbers cited in the text for the ΔSOC model: the SHAP contribution of degraded prior land use (training set) and how often pruning was reported (all modelled ΔSOC rows).
+
+```{r cited-soc-numbers}
+
+soc_shaps <- as.data.frame(shap_list$soc$shaps)
+soc_baked <- bake(extract_recipe(fit_list$soc), new_data = test_data_list$soc$train_df)
+stopifnot(nrow(soc_baked) == nrow(soc_shaps))
+tibble(prior_degraded = soc_baked$prior_DEGRADED == 1, shap = soc_shaps$prior_DEGRADED) |>
+  group_by(prior_degraded) |>
+  summarise(n = n(), mean_shap = mean(shap), .groups = "drop")
+
+bind_rows(test_data_list$soc$train_df, test_data_list$soc$df) |>
+  count(pruning) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+
+```
+
+---
+
+## Partial dependence plots — top 6 predictors per pool
+
+```{r pdp-plots, fig.width = 9, fig.height = 10}
+
+# Top 6 predictors per pool by grouped mean |SHAP| (shap-rank), in rank order
+top6 <- shap_rank |>
+  filter(rank <= 6) |>
+  dplyr::select(c_pool, parent_var, label, rank) |>
+  arrange(c_pool, rank)
+
+# Levels of `var` kept by step_other in the fitted recipe (NULL if not pooled)
+retained_levels <- function(fit, var) {
+  rec <- extract_recipe(fit)
+  i <- which(map_lgl(rec$steps, \(s) inherits(s, "step_other")))
+  if (length(i) == 0) return(NULL)
+  kept <- tidy(rec, number = i) |> filter(terms == var) |> pull(retained)
+  if (length(kept) == 0) NULL else kept
+}
+
+
+# Manual PDP: for each grid value of the focal variable, replace that column in ALL
+# training rows and average the workflow's predictions. Categorical levels that
+# step_other pooled in the fitted recipe all get the same prediction, so they are
+# shown as a single "rare_pooled" point.
+compute_pdp <- function(fit, var, train_df, grid_n = 20) {
+  pooled <- character(0)
+  if (is.numeric(train_df[[var]])) {
+    grid_vals <- seq(
+      quantile(train_df[[var]], 0.02, na.rm = TRUE),
+      quantile(train_df[[var]], 0.98, na.rm = TRUE),
+      length.out = grid_n
+    )
+  } else {
+    grid_vals <- sort(unique(na.omit(train_df[[var]])))
+    kept   <- retained_levels(fit, var)
+    pooled <- if (is.null(kept)) character(0) else setdiff(grid_vals, kept)
+    if (length(pooled) > 0) grid_vals <- c(setdiff(grid_vals, pooled), pooled[1])
+  }
+  purrr::map_dfr(grid_vals, function(val) {
+    nd <- train_df
+    nd[[var]] <- val
+    x_lab <- if (!is.numeric(val) && val %in% pooled) "rare_pooled" else val
+    tibble(x_val = x_lab, yhat = mean(predict(fit, new_data = nd)$.pred, na.rm = TRUE))
+  })
+}
+
+# Pass 1: compute all PDP data and store with metadata for shared y-limit calculation
+pdp_data_list <- list()
+
+for (pool in c_data_names_rf) {
+  vars_df  <- top6 |> filter(c_pool == pool)
+  fit      <- fit_list[[pool]]
+  train_df <- test_data_list[[pool]]$train_df
+
+  for (i in seq_len(nrow(vars_df))) {
+    key <- paste(pool, vars_df$rank[i])
+    pdp_data_list[[key]] <- list(
+      pool      = pool,
+      var       = vars_df$parent_var[i],
+      var_label = vars_df$label[i],
+      is_cont   = is.numeric(train_df[[vars_df$parent_var[i]]]),
+      pd        = compute_pdp(fit, vars_df$parent_var[i], train_df)
+    )
+  }
+}
+
+# Shared y-axis limits: one range covering all 6 predictors within each pool
+y_limits <- lapply(c_data_names_rf, function(pool) {
+  range(unlist(lapply(pdp_data_list[paste(pool, 1:6)], \(d) d$pd$yhat)), na.rm = TRUE)
+}) |> setNames(c_data_names_rf)
+
+# Pass 2: build plots with shared y limits and consistent theme
+pdp_base_theme <- theme_classic(base_size = 11) +
+  theme(axis.title = element_text(size = 10),
+        axis.text  = element_text(size = 9))
+
+make_pdp_plot <- function(d, y_lims) {
+  pd      <- d$pd
+  y_label <- if (d$pool == "agc") "AGC (Mg C ha\u207B\u00B9)" else "\u0394SOC (Mg C ha\u207B\u00B9)"
+
+  if (d$is_cont) {
+    ggplot(pd, aes(x = x_val, y = yhat)) +
+      geom_line(linewidth = 0.7) +
+      coord_cartesian(ylim = y_lims) +
+      labs(x = d$var_label, y = y_label) +
+      pdp_base_theme
+  } else {
+    pd <- pd |>
+      mutate(x_val = as.character(x_val),
+             x_val = coalesce(unname(level_display_labels[x_val]), x_val))
+    ggplot(pd, aes(x = reorder(x_val, yhat), y = yhat)) +
+      geom_point(size = 1.5) +
+      coord_cartesian(ylim = y_lims) +
+      labs(x = d$var_label, y = y_label) +
+      pdp_base_theme +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+  }
+}
+
+pdp_plot_list <- lapply(names(pdp_data_list), function(key) {
+  d <- pdp_data_list[[key]]
+  make_pdp_plot(d, y_limits[[d$pool]])
+}) |> setNames(names(pdp_data_list))
+
+# Add y-axis label to left-column panels only (ranks 1 and 4); suppress elsewhere
+pdp_plot_final <- lapply(names(pdp_plot_list), function(key) {
+  parts   <- strsplit(key, " ")[[1]]
+  pool    <- parts[1]
+  rank    <- as.integer(parts[2])
+  y_label <- if (pool == "agc") "AGC (Mg C ha\u207B\u00B9)" else "\u0394SOC (Mg C ha\u207B\u00B9)"
+  if (rank %in% c(1, 4)) {
+    pdp_plot_list[[key]] + labs(y = y_label)
+  } else {
+    pdp_plot_list[[key]] + labs(y = NULL)
+  }
+}) |> setNames(names(pdp_plot_list))
+
+# Assemble with cowplot: pixel-perfect alignment + pool titles
+agc_aligned  <- align_plots(plotlist = pdp_plot_final[paste("agc", 1:6)], align = "hv", axis = "tblr")
+soc_aligned  <- align_plots(plotlist = pdp_plot_final[paste("soc", 1:6)], align = "hv", axis = "tblr")
+# Panel labels run continuously a-l across the whole combined figure
+# (a-f for AGC, g-l for SOC)
+agc_grid     <- plot_grid(plotlist = agc_aligned, ncol = 3,
+                          labels = letters[1:6], label_size = 12)
+soc_grid     <- plot_grid(plotlist = soc_aligned, ncol = 3,
+                          labels = letters[7:12], label_size = 12)
+
+make_title_plot <- function(label) {
+  ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = label,
+             fontface = "bold", size = 5, hjust = 0.5) +
+    theme_void() +
+    theme(plot.background = element_rect(fill = "white", colour = NA))
+}
+
+agc_title <- make_title_plot("AGC")
+soc_title <- make_title_plot("\u0394SOC")
+
+combined_pdp <- plot_grid(
+  agc_title, agc_grid,
+  soc_title, soc_grid,
+  ncol = 1,
+  rel_heights = c(0.04, 1, 0.04, 1)
+)
+
+combined_pdp
+
+ggsave(here("output", "figures", "rf_pdp_top6.png"), combined_pdp,
+       width = 9, height = 10, dpi = 300)
+
+```
+
+---
+
+## Partial dependence plots — top 9 predictors, separate AGC and SOC
+
+```{r pdp-plots-top9, fig.width = 9, fig.height = 9}
+
+top9 <- shap_rank |>
+  filter(rank <= 9) |>
+  dplyr::select(c_pool, parent_var, label, rank) |>
+  arrange(c_pool, rank)
+
+# Extend pdp_data_list with ranks 7-9 (reuse ranks 1-6 already computed)
+pdp_data_list9 <- pdp_data_list  # start from existing top-6 data
+
+for (pool in c_data_names_rf) {
+  vars_df  <- top9 |> filter(c_pool == pool, rank > 6)
+  fit      <- fit_list[[pool]]
+  train_df <- test_data_list[[pool]]$train_df
+
+  for (i in seq_len(nrow(vars_df))) {
+    key <- paste(pool, vars_df$rank[i])
+    pdp_data_list9[[key]] <- list(
+      pool      = pool,
+      var       = vars_df$parent_var[i],
+      var_label = vars_df$label[i],
+      is_cont   = is.numeric(train_df[[vars_df$parent_var[i]]]),
+      pd        = compute_pdp(fit, vars_df$parent_var[i], train_df)
+    )
+  }
+}
+
+# Shared y limits across all 9 per pool
+y_limits9 <- lapply(c_data_names_rf, function(pool) {
+  range(unlist(lapply(pdp_data_list9[paste(pool, 1:9)], \(d) d$pd$yhat)), na.rm = TRUE)
+}) |> setNames(c_data_names_rf)
+
+# Build plots — left column = ranks 1, 4, 7
+pdp_plot_list9 <- lapply(paste(rep(c_data_names_rf, each = 9), 1:9), function(key) {
+  d       <- pdp_data_list9[[key]]
+  parts   <- strsplit(key, " ")[[1]]
+  pool    <- parts[1]
+  rank    <- as.integer(parts[2])
+  y_label <- if (pool == "agc") "AGC (Mg C ha\u207B\u00B9)" else "\u0394SOC (Mg C ha\u207B\u00B9)"
+  p <- make_pdp_plot(d, y_limits9[[pool]])
+  if (rank %in% c(1, 4, 7)) p + labs(y = y_label) else p + labs(y = NULL)
+}) |> setNames(paste(rep(c_data_names_rf, each = 9), 1:9))
+
+# Separate figures per pool
+for (pool in c_data_names_rf) {
+  keys    <- paste(pool, 1:9)
+  aligned <- align_plots(plotlist = pdp_plot_list9[keys], align = "hv", axis = "tblr")
+  grid    <- plot_grid(plotlist = aligned, ncol = 3,
+                       labels = letters[1:9], label_size = 12)
+  title   <- make_title_plot(pool_labels[pool])
+  fig     <- plot_grid(title, grid, ncol = 1, rel_heights = c(0.04, 1))
+
+  print(fig)
+
+  ggsave(paste0(here("output", "figures"), "/rf_pdp_top9_", pool, ".png"),
+         fig, width = 9, height = 9, dpi = 300)
+}
+
+```
+
+---
+
+## Model diagnostics
+
+```{r diag-plots, fig.width = 7, fig.height = 6}
+
+aug_list <- lapply(c_data_names_rf, function(pool) {
+  td      <- test_data_list[[pool]]
+  outcome <- td$outcome
+  predict(fit_list[[pool]], new_data = td$df) |>
+    bind_cols(td$df |> dplyr::select(all_of(outcome))) |>
+    rename(pred = .pred, measured = all_of(outcome)) |>
+    mutate(c_pool = pool_labels[pool])
+})
+
+aug_tbl <- bind_rows(aug_list)
+
+# Compute per-pool axis range to enforce identical x and y scales within each facet
+ax_lims <- aug_tbl |>
+  group_by(c_pool) |>
+  summarise(ax_min = min(pred, measured), ax_max = max(pred, measured), .groups = "drop")
+
+# Dummy corner points that force equal x/y limits per measured-vs-predicted panel
+diag_dummy <- bind_rows(
+  ax_lims |> mutate(pred = ax_min, measured = ax_min),
+  ax_lims |> mutate(pred = ax_max, measured = ax_max),
+  ax_lims |> mutate(pred = ax_min, measured = ax_max),
+  ax_lims |> mutate(pred = ax_max, measured = ax_min)
+) |> dplyr::select(c_pool, pred, measured)
+
+aug_tbl_resid <- aug_tbl |> mutate(resid = measured - pred)
+
+pub_diag_theme <- theme_classic(base_size = 10) +
+  theme(
+    plot.title = element_text(face = "bold", size = 10, hjust = 0.5),
+    axis.title = element_text(size = 9),
+    axis.text  = element_text(size = 8),
+    plot.tag   = element_text(face = "bold", size = 10)
+  )
+
+# Labels on outer edges only: y on left column, x on bottom row
+# Measured vs predicted — AGC (top-left: y label, no x label)
+p_mvp_agc <- ggplot(aug_tbl |> filter(c_pool == "AGC"), aes(x = pred, y = measured)) +
+  geom_blank(data = diag_dummy |> filter(c_pool == "AGC")) +
+  geom_point(alpha = 0.4, size = 0.8, color = "#334155") +
+  geom_abline(intercept = 0, slope = 1, color = "#ef4444", linetype = "dashed", linewidth = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "#3b82f6", linewidth = 0.6) +
+  labs(title = "AGC", x = NULL, y = "Measured (Mg ha\u207B\u00B9)") +
+  pub_diag_theme
+
+# Measured vs predicted — \u0394SOC (top-right: no labels)
+p_mvp_soc <- ggplot(aug_tbl |> filter(c_pool == "\u0394SOC"), aes(x = pred, y = measured)) +
+  geom_blank(data = diag_dummy |> filter(c_pool == "\u0394SOC")) +
+  geom_point(alpha = 0.4, size = 0.8, color = "#334155") +
+  geom_abline(intercept = 0, slope = 1, color = "#ef4444", linetype = "dashed", linewidth = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "#3b82f6", linewidth = 0.6) +
+  labs(title = "\u0394SOC", x = NULL, y = NULL) +
+  pub_diag_theme
+
+# Residuals vs predicted — AGC (bottom-left: both labels)
+p_resid_agc <- ggplot(aug_tbl_resid |> filter(c_pool == "AGC"), aes(x = pred, y = resid)) +
+  geom_hline(yintercept = 0, color = "#ef4444", linetype = "dashed", linewidth = 0.5) +
+  geom_point(alpha = 0.4, size = 0.8, color = "#334155") +
+  geom_smooth(method = "loess", se = FALSE, color = "#3b82f6", linewidth = 0.6) +
+  labs(x = "Predicted (Mg ha\u207B\u00B9)", y = "Residual (Mg ha\u207B\u00B9)") +
+  pub_diag_theme
+
+# Residuals vs predicted — \u0394SOC (bottom-right: x label only)
+p_resid_soc <- ggplot(aug_tbl_resid |> filter(c_pool == "\u0394SOC"), aes(x = pred, y = resid)) +
+  geom_hline(yintercept = 0, color = "#ef4444", linetype = "dashed", linewidth = 0.5) +
+  geom_point(alpha = 0.4, size = 0.8, color = "#334155") +
+  geom_smooth(method = "loess", se = FALSE, color = "#3b82f6", linewidth = 0.6) +
+  labs(x = "Predicted (Mg ha\u207B\u00B9)", y = NULL) +
+  pub_diag_theme
+
+aligned_diag <- cowplot::align_plots(
+  p_mvp_agc, p_mvp_soc, p_resid_agc, p_resid_soc,
+  align = "hv", axis = "tblr"
+)
+
+diag_panel <- cowplot::plot_grid(
+  plotlist       = aligned_diag,
+  nrow           = 2,
+  labels         = c("a)", "b)", "c)", "d)"),
+  label_size     = 10,
+  label_fontface = "bold"
+)
+
+diag_panel
+
+ggsave(here("output", "figures", "rf_model_diagnostics.png"), diag_panel,
+       width = 7, height = 6, dpi = 300)
+
+```
+
+---
+
+## Extreme prediction profiling
+
+Exploratory (figures are displayed only, not saved): compare predictor distributions among training observations with the lowest 10%, middle and highest 10% of model predictions.
+
+```{r extreme-profiling-setup}
+
+# Helper: top N continuous (numeric) predictors for a pool, from the SHAP ranking
+get_top_cont_vars <- function(pool, n = 6) {
+  train_df <- test_data_list[[pool]]$train_df
+  shap_rank |>
+    rename(variable = parent_var) |>
+    filter(c_pool == pool) |>
+    filter(
+      variable %in% names(train_df),
+      map_lgl(variable, \(v) is.numeric(train_df[[v]]))
+    ) |>
+    slice_head(n = n) |>
+    select(variable, label)
+}
+
+# Predict on training data and label extreme groups (P10 / P90 of predictions)
+extreme_list <- list()
+
+for (pool in c_data_names_rf) {
+
+  fit      <- fit_list[[pool]]
+  train_df <- test_data_list[[pool]]$train_df
+
+  aug <- predict(fit, new_data = train_df) |>
+    bind_cols(train_df) |>
+    rename(pred = .pred)
+
+  q_lo <- quantile(aug$pred, 0.10)
+  q_hi <- quantile(aug$pred, 0.90)
+
+  aug <- aug |>
+    mutate(pred_group = factor(
+      case_when(
+        pred <= q_lo ~ "Low (\u2264P10)",
+        pred >= q_hi ~ "High (\u2265P90)",
+        TRUE         ~ "Middle"
+      ),
+      levels = c("Low (\u2264P10)", "Middle", "High (\u2265P90)")
+    ))
+
+  extreme_list[[pool]] <- aug
+  cat(pool, ": Low n =", sum(aug$pred_group == "Low (\u2264P10)"),
+      "| Middle n =", sum(aug$pred_group == "Middle"),
+      "| High n =",  sum(aug$pred_group == "High (\u2265P90)"), "\n")
+}
+
+```
+
+---
+
+### Extreme profiling — continuous predictors
+
+```{r extreme-cont, fig.width = 11, fig.height = 7}
+
+for (pool in c_data_names_rf) {
+
+  aug      <- extreme_list[[pool]]
+  top_cont <- get_top_cont_vars(pool, n = 6)
+
+  if (nrow(top_cont) == 0) next
+
+  cont_long <- aug |>
+    select(pred_group, all_of(top_cont$variable)) |>
+    pivot_longer(-pred_group, names_to = "variable", values_to = "value") |>
+    left_join(top_cont, by = "variable") |>
+    mutate(label = factor(label, levels = top_cont$label))
+
+  p <- ggplot(cont_long, aes(x = pred_group, y = value)) +
+    geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3, linewidth = 0.4) +
+    facet_wrap(~ label, scales = "free_y", ncol = 3) +
+    labs(
+      title    = paste0(pool_labels[pool],
+                        " \u2014 Continuous predictor distributions by prediction group"),
+      subtitle = "P10 = bottom 10% of predictions; P90 = top 10%",
+      x        = NULL,
+      y        = NULL
+    ) +
+    theme_classic(base_size = 10) +
+    theme(
+      strip.background = element_blank(),
+      strip.text       = element_text(face = "bold", size = 9)
+    )
+
+  print(p)
+}
+
+```
+
+---
+
+### Extreme profiling — categorical predictors
+
+```{r extreme-cat, fig.width = 12, fig.height = 5}
+
+make_cat_prop_plot <- function(aug, cat_var, var_title, label_map = NULL) {
+  tbl <- aug |>
+    count(pred_group, value = .data[[cat_var]]) |>
+    group_by(pred_group) |>
+    mutate(prop = n / sum(n)) |>
+    ungroup()
+
+  if (!is.null(label_map))
+    tbl <- tbl |> mutate(value = recode(value, !!!label_map))
+
+  ggplot(tbl, aes(x = pred_group, y = prop, fill = value)) +
+    geom_col(width = 0.7) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(title = var_title, x = NULL, y = "Proportion", fill = NULL) +
+    theme_classic(base_size = 9) +
+    theme(legend.text = element_text(size = 7), legend.key.size = unit(0.35, "cm"))
+}
+
+for (pool in c_data_names_rf) {
+  aug <- extreme_list[[pool]]
+
+  p_af  <- make_cat_prop_plot(aug, "af_cat",
+                               "Agroforestry category", af_cat_labels)
+  p_eco <- make_cat_prop_plot(aug, "ecoregion",
+                               "Ecoregion")
+
+  print(
+    wrap_plots(p_af, p_eco, ncol = 2) +
+      plot_annotation(
+        title = paste0(pool_labels[pool],
+                       " \u2014 Categorical composition by prediction group")
+      )
+  )
+}
+
+```
+
+---
+
+### Extreme profiling — summary table
+
+```{r extreme-summary-table}
+
+extreme_summary <- map_dfr(c_data_names_rf, function(pool) {
+  aug      <- extreme_list[[pool]]
+  top_cont <- get_top_cont_vars(pool, n = 8)
+
+  num_summary <- aug |>
+    group_by(pred_group) |>
+    summarise(
+      across(all_of(top_cont$variable), \(x) median(x, na.rm = TRUE)),
+      n = n(),
+      median_pred = median(pred),
+      .groups = "drop"
+    ) |>
+    pivot_longer(-c(pred_group, n, median_pred),
+                 names_to = "variable", values_to = "median_val") |>
+    left_join(top_cont, by = "variable") |>
+    mutate(c_pool = pool)
+})
+
+extreme_summary |>
+  mutate(across(where(is.numeric), \(x) round(x, 2)))
+
+```
+
+---
+
+## SHAP — interaction heatmap
+
+```{r shap-interaction-heatmap, fig.width = 11, fig.height = 5}
+
+# Helper: attach readable labels to a vector of variable names
+attach_labels <- function(vars) {
+  tibble(variable = vars) |>
+    left_join(dummy_label_map,      by = c("variable" = "dummy_col")) |>
+    left_join(predictor_label_lkup, by = c("variable" = "Variable")) |>
+    mutate(label = coalesce(label, Label, variable)) |>
+    pull(label)
+}
+
+inter_plots <- lapply(c_data_names_rf, function(pool) {
+
+  inter_arr <- shap_inter_list[[pool]]$interactions
+
+  # Mean absolute pairwise interaction (exclude main-effect diagonal)
+  inter_mat        <- apply(abs(inter_arr), c(1, 2), mean)
+  diag(inter_mat)  <- NA
+
+  # Focus on top 15 variables by total off-diagonal interaction
+  top_vars <- sort(rowSums(inter_mat, na.rm = TRUE), decreasing = TRUE) |>
+    head(15) |> names()
+
+  inter_long <- inter_mat[top_vars, top_vars] |>
+    as.data.frame() |>
+    rownames_to_column("var1") |>
+    pivot_longer(-var1, names_to = "var2", values_to = "interaction") |>
+    filter(!is.na(interaction), var1 < var2) |>   # upper triangle only
+    mutate(
+      label1 = attach_labels(var1),
+      label2 = attach_labels(var2)
+    )
+
+  # Reorder both axes by total interaction strength.
+  # Use union of label1 and label2 so the lexicographically-last variable
+  # (which only appears as var2 in the upper triangle) is included in factor levels.
+  axis_order <- bind_rows(
+    inter_long |> select(label = label1, interaction),
+    inter_long |> select(label = label2, interaction)
+  ) |>
+    group_by(label) |> summarise(tot = sum(interaction)) |>
+    arrange(tot) |> pull(label)
+
+  inter_long <- inter_long |>
+    mutate(
+      label1 = factor(label1, levels = axis_order),
+      label2 = factor(label2, levels = rev(axis_order))
+    )
+
+  ggplot(inter_long, aes(x = label1, y = label2, fill = interaction)) +
+    geom_tile(colour = "white", linewidth = 0.3) +
+    scale_fill_viridis_c(name = "Mean\n|interaction|", option = "magma", direction = -1) +
+    facet_wrap(~ pool_labels[pool]) +
+    labs(x = NULL, y = NULL) +
+    theme_classic(base_size = 8) +
+    theme(
+      axis.text.x      = element_text(angle = 45, hjust = 1, size = 7),
+      axis.text.y      = element_text(size = 7),
+      strip.background = element_blank(),
+      strip.text       = element_text(face = "bold", size = 10),
+      legend.text      = element_text(size = 7),
+      legend.title     = element_text(size = 7)
+    )
+})
+
+wrap_plots(inter_plots, ncol = 2) +
+  plot_annotation(
+    title    = "SHAP pairwise interaction strengths",
+    subtitle = "Mean absolute SHAP interaction value; upper triangle; top 15 variables by total interaction"
+  )
+
+ggsave(here("output", "figures", "rf_shap_interaction_heatmap.png"),
+       wrap_plots(inter_plots, ncol = 2) +
+         plot_annotation(title = "SHAP pairwise interaction strengths"),
+       width = 11, height = 5, dpi = 300)
+
+```
+
+---
+
+## SHAP — top interaction pairs
+
+```{r shap-top-pairs}
+
+# Tabulate the strongest pairwise interactions across both pools
+top_pairs <- map_dfr(c_data_names_rf, function(pool) {
+
+  inter_arr <- shap_inter_list[[pool]]$interactions
+  inter_mat <- apply(abs(inter_arr), c(1, 2), mean)
+  diag(inter_mat) <- NA
+
+  as.data.frame(inter_mat) |>
+    rownames_to_column("var1") |>
+    pivot_longer(-var1, names_to = "var2", values_to = "mean_abs_interaction") |>
+    filter(!is.na(mean_abs_interaction), var1 < var2) |>
+    mutate(
+      label1 = attach_labels(var1),
+      label2 = attach_labels(var2),
+      c_pool = pool_labels[pool]
+    ) |>
+    arrange(desc(mean_abs_interaction)) |>
+    slice_head(n = 20) |>
+    select(c_pool, label1, label2, mean_abs_interaction)
+})
+
+top_pairs |>
+  mutate(mean_abs_interaction = round(mean_abs_interaction, 3))
+
+write_csv(top_pairs, here("output", "tables", "rf_shap_top_interaction_pairs.csv"))
+
+```
+
+---
+
+## SHAP — beeswarm plot
+
+```{r shap-beeswarm, fig.width = 11, fig.height = 6}
+
+make_shap_beeswarm <- function(pool, n_vars = 15) {
+
+  shap_mat   <- as.data.frame(shap_list[[pool]]$shaps, check.names = FALSE)
+  train_data <- test_data_list[[pool]]$train_df
+  outcome_v  <- test_data_list[[pool]]$outcome
+  X_baked    <- bake(extract_recipe(fit_list[[pool]]), new_data = train_data) |>
+    select(-all_of(outcome_v))
+
+  # Top n variables by mean |SHAP|, in descending order
+  top_vars <- colMeans(abs(shap_mat)) |>
+    sort(decreasing = TRUE) |>
+    head(n_vars) |>
+    names()
+
+  shap_long <- shap_mat[, top_vars, drop = FALSE] |>
+    mutate(obs = row_number()) |>
+    pivot_longer(-obs, names_to = "variable", values_to = "shap_value")
+
+  feat_long <- as.data.frame(X_baked, check.names = FALSE)[, top_vars, drop = FALSE] |>
+    mutate(obs = row_number()) |>
+    pivot_longer(-obs, names_to = "variable", values_to = "feature_value")
+
+  plot_df <- left_join(shap_long, feat_long, by = c("obs", "variable")) |>
+    group_by(variable) |>
+    # Rank-based rescaling: distributes colour uniformly across observations
+    # regardless of feature distribution (handles skewed variables like age).
+    mutate(feature_scaled = scales::rescale(rank(as.numeric(feature_value),
+                                                  ties.method = "average"))) |>
+    ungroup() |>
+    mutate(
+      label = attach_labels(variable),
+      # Factor ordered so highest-importance variable appears at top of y-axis
+      label = factor(label, levels = attach_labels(rev(top_vars)))
+    )
+
+  ggplot(plot_df, aes(x = shap_value, y = label, colour = feature_scaled)) +
+    geom_vline(xintercept = 0, linewidth = 0.35, linetype = "dashed", colour = "grey50") +
+    geom_quasirandom(groupOnX = FALSE, size = 0.45, alpha = 0.55, bandwidth = 0.4) +
+    scale_colour_gradient(
+      low    = "#3b82f6",
+      high   = "#ef4444",
+      name   = "Predictor\nvalue",
+      breaks = c(0, 1),
+      labels = c("Low", "High"),
+      guide  = guide_colorbar(barheight = unit(3, "cm"), ticks = FALSE)
+    ) +
+    labs(title = pool_labels[pool], x = expression("SHAP value" ~ (Mg ~ C ~ ha^{-1})), y = NULL) +
+    theme_classic(base_size = 10) +
+    theme(
+      plot.title         = element_text(face = "bold", hjust = 0.5, size = 11),
+      panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.3),
+      axis.text.y        = element_text(size = 8),
+      axis.text.x        = element_text(size = 8),
+      legend.title       = element_text(size = 8),
+      legend.text        = element_text(size = 7)
+    )
+}
+
+bee_agc <- make_shap_beeswarm("agc")
+bee_soc <- make_shap_beeswarm("soc")
+
+p_bee_assembled <- bee_agc + bee_soc + plot_layout(guides = "collect")
+
+# Baseline = mean model prediction on training data (reference point for SHAP values)
+baselines <- sapply(c_data_names_rf, function(pool) {
+  mean(predict(fit_list[[pool]], new_data = test_data_list[[pool]]$train_df)$.pred,
+       na.rm = TRUE)
+})
+
+p_bee_assembled
+
+ggsave(here("output", "figures", "rf_shap_beeswarm.png"), p_bee_assembled,
+       width = 11, height = 6, dpi = 300)
+
+```
+
+---
+
+## Summary
+
+```{r summary}
+
+perf_tbl
+
+```

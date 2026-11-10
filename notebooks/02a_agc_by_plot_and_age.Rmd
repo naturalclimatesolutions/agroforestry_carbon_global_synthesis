@@ -1,0 +1,457 @@
+---
+title: "02a - Aboveground carbon (AGC) by plot and age"
+output: html_document
+---
+
+**Purpose.** Compute aboveground carbon (AGC) stocks and AGC change rates per plot (`ssp_id`) and stand age from the measurements table of the GROA-AF dataset, restricted to agroforestry categories. For each plot and age, carbon values are preferred over biomass, totals over sub-pools, duplicate variables are summed or averaged according to `dupe_var_aggregation`, and remaining pools are summed into one stock value. Change rates (t C/ha/yr) are calculated from the stocks (as a chronosequence where possible, otherwise relative to zero at age 0), and directly reported AGC change rows are then appended. Rows needing attention are marked in the `flag` column.
+
+**Inputs.**
+
+- `data/groa_af/measurements.csv` (GROA-AF dataset)
+
+**Outputs.**
+
+- `output/data/agc_by_plot_and_age.xlsx`
+- `output/data/agc_change_by_plot_and_age.xlsx` (written after the stock section, then overwritten with directly reported change rows appended)
+
+```{r setup}
+library(here)
+library(tidyverse)
+library(openxlsx)
+
+options(dplyr.summarise.inform=FALSE) # silence dplyr groupby message
+```
+
+Load AGC and AGC change rows (with a non-empty `c_t_ha`) from the measurements table and build the plot ID (`ssp_id`).
+```{r load-s3}
+
+af_cats <- c('AC', 'BP', 'COP', 'FAL', 'FOD', 'MS', 'OTH_AF', 'PAR', 'RB', 'ROT', 'SA', 'SP', 'SPC', 'TMC', 'WL')
+
+s3_df <- read.csv(here("data", "groa_af", "measurements.csv"),
+                  colClasses = "character", na.strings = "", fileEncoding = "UTF-8-BOM") %>%
+  select(study_id, site_id, plot_id, af_cat, measurement_year, age_yrs, variable_name, dupe_var_aggregation, measured_pool, c_pool, c_t_ha, species_af, genera_af) %>%
+  filter(!(c_t_ha == '' | is.na(c_t_ha))) %>%
+  mutate(ssp_id = paste0(study_id, ';', site_id, ';', plot_id)) %>%
+  select(-c(study_id, site_id, plot_id)) %>%
+  filter(c_pool %in% c("AGC", "AGC_change"))
+
+```
+
+
+Helper function to compile comma-separated lists of unique values.
+```{r helper-csl}
+
+# function to compile comma-separated lists of data for output
+make_csl <- function(vec) {
+  csl_all <- paste0(vec, collapse = ', ')
+  vec <- str_split_1(csl_all, pattern = ', ') %>%
+    trimws() %>%
+    unique() %>%
+    sort()
+  vec <- vec[!is.na(vec) & vec != 'NA']
+  return (paste0(vec, collapse = ', '))
+}
+
+```
+
+
+Parse `age_yrs` and `c_t_ha` from text to numeric (ranges like "5 to 10" are averaged; "<" / ">" values are shifted by -1 / +1; unparseable values become 9999).
+```{r parse-numeric}
+
+parse_num <- function (num_str) {
+  mod <- 0
+  if (grepl('<', num_str)) {mod <- -1}
+  if (grepl('>', num_str)) {mod <- 1}
+  num_str <- num_str %>% str_remove('<') %>% str_remove('>')
+  if (is.na(num_str) || num_str == '') {
+    return(NA)
+  } else if (!is.na(as.numeric(num_str))) {
+    return(as.numeric(num_str) + mod)
+  } else if (grepl('to', num_str)) {
+    num_strs <- num_str %>%
+      str_split_1('to') %>%
+      trimws()
+    return(mean(c(as.numeric(num_strs[1]), as.numeric(num_strs[2]))))
+  } else {
+    return(9999)
+  }
+}
+
+# convert age_yrs and c_t_ha to numeric
+s3_df <- s3_df %>%
+  rowwise() %>%
+  mutate(age_yrs = parse_num(age_yrs)) %>%
+  mutate(c_t_ha = parse_num(c_t_ha))
+
+```
+
+# Calculate rows marked as AGC
+
+For each plot and age, collapse AGC rows to a single stock value, then compute AGC change rates from the stocks, and write both tables.
+```{r agc-stock}
+
+# init final output dataframes
+c_df <- data.frame()
+c_change_df <- data.frame()
+
+# filter to C (not change) rows and pull ssp_ids
+s3_df_agc <- s3_df %>% filter(c_pool == 'AGC')
+ssp_ids <- s3_df_agc %>% pull(ssp_id) %>% unique()
+
+for (i in 1:length(ssp_ids)) {
+  if (i %% 1000 == 1) {
+    print(paste("Parsing plots", i, '-', min(length(ssp_ids), i+999),
+                'of', length(ssp_ids)))
+  }
+  
+  my_flag <- NA
+  
+  pid <- ssp_ids[i]
+  plot_dat_in <- s3_df_agc %>% filter(ssp_id == pid)
+  
+  # sort by age and replace age == NA with 9999
+  plot_dat_in <- plot_dat_in %>%
+    arrange(age_yrs) %>%
+    mutate(age_yrs = replace_na(age_yrs, 9999))
+  
+  
+  # parse af category
+  my_af_cat <- plot_dat_in$af_cat %>% unique()
+  my_af_cat_y0 <- NA
+  
+  # if there are multiple af.cats, filter out age == 0 or age == NA from af_cat 
+  # (can be a control in some cases), also save ctrl as my_af_cat_y0
+  if (my_af_cat %>% length() > 1 && (0 %in% plot_dat_in$age_yrs || 9999 %in% plot_dat_in$age_yrs)) {
+    my_af_cat <- plot_dat_in %>% filter(age_yrs != 0 && age_yrs != 9999) %>% select(af_cat) %>% 
+      unique() %>% pull()
+    my_af_cat_y0 <- plot_dat_in %>% filter(age_yrs == 0 || age_yrs == 9999) %>% select(af_cat) %>% 
+      unique() %>% pull()
+  }
+  # if my_af_cat_y0 is FOR, set flag
+  if (!is.na(my_af_cat_y0) && my_af_cat_y0 == 'FOR') {
+    my_flag <- 'forest_ref'
+  }
+  # if there are still multiple af.cats, set CHECK flag
+  if (my_af_cat %>% length() > 1) {
+    my_af_cat <- 'CHECK_multi_af_cat'
+  } 
+  if (my_af_cat_y0 %>% length() > 1) {
+    my_af_cat_y0 <- 'CHECK_multi_af_cat'
+  } 
+  
+  # make output dataframe
+  plot_dat_out <- data.frame()
+  
+  # only compute data for af_cats
+  
+  if (grepl(paste0(af_cats, collapse = '|'), my_af_cat)) {
+    
+    for (my_age in plot_dat_in$age_yrs %>% unique()) {
+      # Make new df for each unique age
+      my_age_dat <- plot_dat_in %>% filter(age_yrs == my_age)
+      
+      # Check if there are carbon AND biomass numbers using var.cat.  
+      # If so, select only carbon numbers
+      if ('AGC' %in% my_age_dat$measured_pool && 'AGB' %in% my_age_dat$measured_pool) {
+        my_age_dat <- my_age_dat %>% filter(measured_pool == 'AGC')
+      }
+      
+      # Check if there is a total pool sum in addition to sub-pools 
+      # (e.g. understory, overstory, AND total_aboveground).  
+      # If so, select only total sum
+      if (length(my_age_dat$variable_name %>% unique()) > 1 &&
+          ('total_aboveground_biomass' %in% my_age_dat$variable_name ||
+           'total_aboveground_carbon' %in% my_age_dat$variable_name)) {
+        my_age_dat <- my_age_dat %>%
+          filter(variable_name %in% c('total_aboveground_biomass', 'total_aboveground_carbon'))
+      }
+      
+      # if there are multiple dates for the same age, turn dates into csl
+      my_age_date_csl <- make_csl(my_age_dat$measurement_year)
+      my_age_dat <- my_age_dat %>% mutate(measurement_year = my_age_date_csl)
+        
+      # make alphabetical list of unique entries in variable_name 
+      # (to determine if well-formed chronosequence later)
+      var_name_csl <- make_csl(my_age_dat$variable_name)
+      
+      # make new df which will contain only one row per variable_name
+      my_age_dat_collapse_varname <- my_age_dat[0,]
+      
+      # collapse each varname to one row by summing or averaging
+      for (my_var_name in my_age_dat$variable_name %>% unique()) {
+        my_age_dat_my_var_name <- my_age_dat %>% filter(variable_name == my_var_name)
+        if (nrow(my_age_dat_my_var_name) > 1) {
+          
+          # if there is nothing in dupe_var_aggregation set flag
+          if (is.na(my_age_dat_my_var_name %>% pull(dupe_var_aggregation) %>% unique())) {
+            my_flag = 'missing_dupe_var_sum_or_avg'
+          } else {
+            # sum or average according to dupe_var_aggregation column
+            if (my_age_dat_my_var_name %>% pull(dupe_var_aggregation) %>% unique() == 'SUM') {
+              my_age_dat_my_var_name <- my_age_dat_my_var_name %>%
+                select(-c(species_af, genera_af)) %>%
+                group_by(across(-c_t_ha)) %>%
+                summarize(c_t_ha = sum(c_t_ha, na.rm = T))
+            } else if (my_age_dat_my_var_name %>% pull(dupe_var_aggregation) %>% unique() == 'AVG') {
+              my_age_dat_my_var_name <- my_age_dat_my_var_name %>%
+                select(-c(species_af, genera_af)) %>%
+                group_by(across(-c_t_ha)) %>%
+                summarize(c_t_ha = mean(c_t_ha, na.rm = T))
+            } else if (my_age_dat_my_var_name %>% pull(dupe_var_aggregation) %>% unique() == 'AVG_spec_then_SUM') {
+              my_age_dat_my_var_name <- my_age_dat_my_var_name %>%
+                group_by(across(-c_t_ha)) %>% 
+                summarize(c_t_ha = mean(c_t_ha, na.rm = T)) %>% # average by species / genera
+                ungroup() %>%
+                select(-c(species_af, genera_af)) %>%
+                group_by(across(-c_t_ha)) %>%
+                summarize(c_t_ha = sum(c_t_ha, na.rm = T)) # sum across species / genera
+            } 
+            # if there are still multiple rows, set flag
+            if (nrow(my_age_dat_my_var_name) > 1) {
+              my_flag = 'dupe_var_could_not_be_collapsed'
+            }
+          }
+        }
+        
+        # add collapsed varname row to my_age_dat_collapse_varname
+        my_age_dat_collapse_varname <- my_age_dat_collapse_varname %>%
+          bind_rows(my_age_dat_my_var_name)
+      } # end of loop across var names
+      
+      # sum all pools for this age to get final row for plot_dat_out
+      my_age_dat_outrow <- my_age_dat_collapse_varname %>%
+        select(-c(species_af, genera_af, variable_name)) %>%
+        group_by(across(-c_t_ha)) %>%
+        summarize(c_t_ha = sum(c_t_ha, na.rm = T)) %>%
+        ungroup() %>%
+        mutate(af_cat = my_af_cat,
+               af_cat_y0 = my_af_cat_y0,
+               var_names = var_name_csl,
+               flag = my_flag) %>%
+        select(ssp_id, af_cat, af_cat_y0, age_yrs, c_t_ha, var_names, flag)
+      
+      # append to plot_dat_out
+      plot_dat_out <- plot_dat_out %>%
+        bind_rows(my_age_dat_outrow)
+      
+    } # end of loop across ages
+    
+    # add plot data to c_df
+    c_df <- c_df %>%
+      bind_rows(plot_dat_out %>% # set age == 9999 back to NA
+                  mutate(age_yrs = ifelse(age_yrs == 9999, NA, age_yrs)))
+    
+    
+    # calculate data for c_change_df
+    
+    # determine whether to treat as chronosequence or individual row(s)
+    # must have multiple rows, a max of one age of 0 or NA, and consistent var_name_csl
+    if (nrow(plot_dat_out) > 1 && 
+        nrow(plot_dat_out %>% filter(age_yrs == 9999 | age_yrs == 0)) <= 1 &&
+        length(plot_dat_out$var_names %>% unique()) == 1) {
+      plot_dat_c_change_calc <- plot_dat_out %>% # replace age == 9999 with 0
+        mutate(age_yrs = ifelse(age_yrs == 9999, 0, age_yrs)) %>%
+        arrange(age_yrs)
+      
+      # if data do not contain a 0 year, add one with c_t_ha = 0
+      if (!0 %in% plot_dat_c_change_calc$age_yrs) {
+        plot_dat_c_change_calc <- plot_dat_c_change_calc[1,] %>%
+                      mutate(age_yrs = 0,
+                             c_t_ha = 0) %>%
+          bind_rows(plot_dat_c_change_calc)
+      }
+      
+      # calculate chronosequence
+      plot_dat_c_change_calc <- plot_dat_c_change_calc %>%
+        mutate(age_min = lag(age_yrs, default = first(age_yrs))) %>%
+        mutate(age_max = age_yrs) %>%
+        mutate(c_t_ha_yr = (c_t_ha - lag(c_t_ha, default = first(c_t_ha))) /
+                 (age_max - age_min)) %>%
+        filter(!is.na(c_t_ha_yr)) %>%
+        mutate(source = 'calculated') %>%
+        select(ssp_id, af_cat, af_cat_y0, age_min, age_max, c_t_ha_yr, var_names, source, flag)
+    } else {
+      # treat each row individually, calc difference to 0
+      plot_dat_c_change_calc <- plot_dat_out %>%
+        filter(age_yrs != 9999) %>% #filter out NA ages (can't calculate change)
+        arrange(age_yrs) %>%
+        mutate(age_min = 0) %>%
+        mutate(age_max = age_yrs) %>%
+        mutate(c_t_ha_yr = c_t_ha / age_yrs) %>%
+        filter(!is.na(c_t_ha_yr)) %>%
+        mutate(source = 'calculated') %>%
+        select(ssp_id, af_cat, af_cat_y0, age_min, age_max, c_t_ha_yr, var_names, source, flag)
+    }
+    
+    # add plot data to c_change_df
+    if (nrow(plot_dat_c_change_calc > 0)) {
+      c_change_df <- c_change_df %>%
+        bind_rows(plot_dat_c_change_calc)
+    }
+    
+  } # end of check whether my_af_cat is in af_cats
+} # end of loop across plots
+
+
+write.xlsx(c_df, here("output", "data", "agc_by_plot_and_age.xlsx"))
+write.xlsx(c_change_df, here("output", "data", "agc_change_by_plot_and_age.xlsx"))
+
+
+```
+
+
+# Calculate rows marked as AGC_change
+
+Append directly reported AGC change rows (source = "direct") to the change table and overwrite the change output file.
+```{r agc-change}
+
+# load final output dataframes
+c_df <- read.xlsx(here("output", "data", "agc_by_plot_and_age.xlsx"))
+c_change_df <- read.xlsx(here("output", "data", "agc_change_by_plot_and_age.xlsx"))
+
+# filter to C change rows and pull ssp_ids
+s3_df_agc_change <- s3_df %>% filter(c_pool == 'AGC_change')
+ssp_ids <- s3_df_agc_change %>% pull(ssp_id) %>% unique()
+
+for (i in 1:length(ssp_ids)) {
+  if (i %% 1000 == 1) {
+    print(paste("Parsing plots", i, '-', min(length(ssp_ids), i+999),
+                'of', length(ssp_ids)))
+  }
+  
+  my_flag <- NA
+  
+  pid <- ssp_ids[i]
+  plot_dat_in <- s3_df_agc_change %>% filter(ssp_id == pid)
+  
+  # sort by age and replace age == NA with 9999
+  plot_dat_in <- plot_dat_in %>%
+    arrange(age_yrs) %>%
+    mutate(age_yrs = replace_na(age_yrs, 9999))
+  
+  
+  # parse af category
+  my_af_cat <- plot_dat_in$af_cat %>% unique()
+  my_af_cat_y0 <- NA
+  
+  # if there are multiple af.cats, filter out age == 0 or age == NA from af_cat 
+  # (can be a control in some cases), also save ctrl as my_af_cat_y0
+  if (my_af_cat %>% length() > 1 && (0 %in% plot_dat_in$age_yrs || 9999 %in% plot_dat_in$age_yrs)) {
+    my_af_cat <- plot_dat_in %>% filter(age_yrs != 0 && age_yrs != 9999) %>% select(af_cat) %>% 
+      unique() %>% pull()
+    my_af_cat_y0 <- plot_dat_in %>% filter(age_yrs == 0 || age_yrs == 9999) %>% select(af_cat) %>% 
+      unique() %>% pull()
+  }
+  # if my_af_cat_y0 is FOR, set flag
+  if (!is.na(my_af_cat_y0) && my_af_cat_y0 == 'FOR') {
+    my_flag <- 'forest_ref'
+  }
+  # if there are still multiple af.cats, set CHECK flag
+  if (my_af_cat %>% length() > 1) {
+    my_af_cat <- 'CHECK_multi_af_cat'
+  } 
+  if (my_af_cat_y0 %>% length() > 1) {
+    my_af_cat_y0 <- 'CHECK_multi_af_cat'
+  } 
+  
+  # make output dataframe
+  plot_dat_out <- data.frame()
+  
+  # only compute data for af_cats
+  
+  if (grepl(paste0(af_cats, collapse = '|'), my_af_cat)) {
+    
+    for (my_age in plot_dat_in$age_yrs %>% unique()) {
+      # Make new df for each unique age
+      my_age_dat <- plot_dat_in %>% filter(age_yrs == my_age)
+      
+      # Check if there are carbon AND biomass numbers using var.cat.  
+      # If so, select only carbon numbers
+      if ('AGC_change' %in% my_age_dat$measured_pool && 'AGB_change' %in% my_age_dat$measured_pool) {
+        my_age_dat <- my_age_dat %>% filter(measured_pool == 'AGC_change')
+      }
+      
+      # if there are multiple dates for the same age, turn dates into csl
+      my_age_date_csl <- make_csl(my_age_dat$measurement_year)
+      my_age_dat <- my_age_dat %>% mutate(measurement_year = my_age_date_csl)
+        
+      # make alphabetical list of unique entries in variable_name 
+      # (to determine if well-formed chronosequence later)
+      var_name_csl <- make_csl(my_age_dat$variable_name)
+      
+      # make new df which will contain only one row per variable_name
+      my_age_dat_collapse_varname <- my_age_dat[0,]
+      
+      # collapse each varname to one row by summing or averaging
+      for (my_var_name in my_age_dat$variable_name %>% unique()) {
+        my_age_dat_my_var_name <- my_age_dat %>% filter(variable_name == my_var_name)
+        if (nrow(my_age_dat_my_var_name) > 1) {
+          
+          # if there is nothing in dupe_var_aggregation set flag
+          if (is.na(my_age_dat_my_var_name %>% pull(dupe_var_aggregation) %>% unique())) {
+            my_flag = 'missing_dupe_var_sum_or_avg'
+          } else {
+            # sum or average according to dupe_var_aggregation column
+            if (my_age_dat_my_var_name %>% pull(dupe_var_aggregation) %>% unique() == 'SUM') {
+              my_age_dat_my_var_name <- my_age_dat_my_var_name %>%
+                select(-c(species_af, genera_af)) %>%
+                group_by(across(-c_t_ha)) %>%
+                summarize(c_t_ha = sum(c_t_ha, na.rm = T))
+            } else if (my_age_dat_my_var_name %>% pull(dupe_var_aggregation) %>% unique() == 'AVG') {
+              my_age_dat_my_var_name <- my_age_dat_my_var_name %>%
+                select(-c(species_af, genera_af)) %>%
+                group_by(across(-c_t_ha)) %>%
+                summarize(c_t_ha = mean(c_t_ha, na.rm = T))
+            } 
+            # if there are still multiple rows, set flag
+            if (nrow(my_age_dat_my_var_name) > 1) {
+              my_flag = 'dupe_var_could_not_be_collapsed'
+            }
+          }
+        }
+        
+        # add collapsed varname row to my_age_dat_collapse_varname
+        my_age_dat_collapse_varname <- my_age_dat_collapse_varname %>%
+          bind_rows(my_age_dat_my_var_name)
+      } # end of loop across var names
+      
+      # sum all pools for this age to get final row for plot_dat_out
+      my_age_dat_outrow <- my_age_dat_collapse_varname %>%
+        select(-c(species_af, genera_af, variable_name)) %>%
+        group_by(across(-c_t_ha)) %>%
+        summarize(c_t_ha = sum(c_t_ha, na.rm = T)) %>%
+        ungroup() %>%
+        mutate(af_cat = my_af_cat,
+               af_cat_y0 = my_af_cat_y0,
+               var_names = var_name_csl,
+               flag = my_flag) %>%
+        select(ssp_id, af_cat, af_cat_y0, age_yrs, c_t_ha, var_names, flag)
+      
+      # append to plot_dat_out
+      plot_dat_out <- plot_dat_out %>%
+        bind_rows(my_age_dat_outrow)
+      
+    } # end of loop across ages
+    
+    # add plot data to c_change_df
+    
+    plot_dat_c_change <- plot_dat_out %>%
+      mutate(age_yrs = ifelse(age_yrs == 9999, NA, age_yrs)) %>%
+      arrange(age_yrs) %>%
+      mutate(age_min = 0) %>%
+      mutate(age_max = age_yrs) %>%
+      rename(c_t_ha_yr = c_t_ha) %>%
+      filter(!is.na(c_t_ha_yr)) %>%
+      mutate(source = 'direct') %>%
+      select(ssp_id, af_cat, af_cat_y0, age_min, age_max, c_t_ha_yr, var_names, source, flag)
+    
+    c_change_df <- c_change_df %>%
+      bind_rows(plot_dat_c_change)
+    
+  } # end of check whether my_af_cat is in af_cats
+} # end of loop across plots
+
+write.xlsx(c_change_df, here("output", "data", "agc_change_by_plot_and_age.xlsx"))
+
+
+```

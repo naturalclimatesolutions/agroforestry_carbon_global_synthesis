@@ -1,0 +1,41 @@
+"","reg_full","af_cat","GROA N","GROA C at maturity","GROA C at maturity CI lower","GROA C at maturity CI upper","GROA C growth rate","GROA C growth rate CI lower","GROA C growth rate CI upper","groa_label","Climate region","GROA agroforestry category","IPCC agroforestry system","IPCC N","IPCC C at maturity","IPCC C at maturity CI pct","IPCC C growth rate","IPCC C growth rate CI pct","ipcc_label","Pct change C at maturity","Pct change C growth rate"
+"1","Tropical/subtropical wet","FAL",183,24.66,11.21,32.29,2.28,1.74,3.19,"Our data (wet)","Tropical/subtropical","Fallows","Fallow",69,22.1,52,4.42,15,"IPCC (wet & dry)",11.5837104072398,-48.4162895927602
+"2","Tropical/subtropical wet","MS",37,46.74,33.61,65.51,2.11,1.39,4.46,"Our data (wet)","Tropical/subtropical","Multistrata","Multistrata",51,65,54,3.25,21,"IPCC (wet & dry)",-28.0923076923077,-35.0769230769231
+"3","Tropical/subtropical wet","SA",98,43.85,37.3,50.62,3.56,2.04,5.76,"Our data (wet)","Tropical/subtropical","Silvoarable","Silvoarable",22,72.2,60,3.61,33,"IPCC (wet & dry)",-39.2659279778393,-1.38504155124653
+"4","Tropical/subtropical wet","SP",65,22.33,14.33,29.08,2.47,1.53,3.35,"Our data (wet)","Tropical/subtropical","Silvopasture","Silvopasture",18,58.2,61,2.91,63,"IPCC (wet & dry)",-61.6323024054983,-15.1202749140893
+"5","Tropical/subtropical wet","SPC",328,60.34,53.05,68.79,1.98,1.7,2.53,"Our data (wet)","Tropical/subtropical","Shaded perennial","Shaded perennial",28,48,55,2.4,24,"IPCC (wet & dry)",25.7083333333333,-17.5
+"6","Tropical/subtropical wet","TMC",106,69.82,47.18,98.67,1.64,1.32,1.92,"Our data (wet)","Tropical/subtropical","Tree monocrop",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"7","Tropical/subtropical wet","WL",588,65.92,59.08,73.8,3.65,3.16,4.28,"Our data (wet)","Tropical/subtropical","Woodlot",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"8","Tropical/subtropical dry","AC",206,15.8,10.54,23.03,1.96,1.51,2.46,"Our data (dry)","Tropical/subtropical","Alley cropping","Alley cropping",90,47.4,52,2.37,13,"IPCC (wet & dry)",-66.6666666666667,-17.2995780590717
+"9","Tropical/subtropical dry","BP",37,10.48,7.55,21.02,1.4,1.07,1.78,"Our data (dry)","Tropical/subtropical","Boundary planting","Hedgerow",3,9.4,59,0.47,31,"IPCC (wet & dry)",11.4893617021277,197.872340425532
+"10","Tropical/subtropical dry","FAL",89,12.13,6.75,29.6,2.69,1.53,4.42,"Our data (dry)","Tropical/subtropical","Fallows","Fallow",69,22.1,52,4.42,15,"IPCC (wet & dry)",-45.1131221719457,-39.1402714932127
+"11","Tropical/subtropical dry","FOD",45,11.63,9.37,14.6,2.57,2.03,3.16,"Our data (dry)","Tropical/subtropical","Fodder bank",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"12","Tropical/subtropical dry","MS",101,32.58,23.51,42.06,0.44,0.32,0.57,"Our data (dry)","Tropical/subtropical","Multistrata","Multistrata",51,65,54,3.25,21,"IPCC (wet & dry)",-49.8769230769231,-86.4615384615385
+"13","Tropical/subtropical dry","SA",155,26.17,21.15,31.88,5.55,4.43,6.2,"Our data (dry)","Tropical/subtropical","Silvoarable","Silvoarable",22,72.2,60,3.61,33,"IPCC (wet & dry)",-63.7534626038781,53.7396121883656
+"14","Tropical/subtropical dry","SP",66,18.22,13.83,28.13,0.85,0.52,1.77,"Our data (dry)","Tropical/subtropical","Silvopasture","Silvopasture",18,58.2,61,2.91,63,"IPCC (wet & dry)",-68.6941580756014,-70.7903780068729
+"15","Tropical/subtropical dry","SPC",162,33.8,29.28,39.17,2.77,2.18,3.82,"Our data (dry)","Tropical/subtropical","Shaded perennial","Shaded perennial",28,48,55,2.4,24,"IPCC (wet & dry)",-29.5833333333333,15.4166666666667
+"16","Tropical/subtropical dry","TMC",113,53.88,42.91,65.17,2.4,2.13,2.74,"Our data (dry)","Tropical/subtropical","Tree monocrop",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"17","Tropical/subtropical dry","WL",1240,51.75,47.26,56.51,8.29,7.96,8.65,"Our data (dry)","Tropical/subtropical","Woodlot",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"18","Tropical/subtropical all","AC",238,14.86,9.68,20.92,1.71,1.39,2.13,"Our data (wet & dry)","Tropical/subtropical","Alley cropping","Alley cropping",90,47.4,52,2.37,13,"IPCC (wet & dry)",-68.6497890295359,-27.8481012658228
+"19","Tropical/subtropical all","BP",49,29.92,12.72,68.69,2.05,1.58,2.98,"Our data (wet & dry)","Tropical/subtropical","Boundary planting","Hedgerow",3,9.4,59,0.47,31,"IPCC (wet & dry)",218.297872340426,336.170212765957
+"20","Tropical/subtropical all","FAL",272,17.63,11.04,32.32,3.08,2.11,3.64,"Our data (wet & dry)","Tropical/subtropical","Fallows","Fallow",69,22.1,52,4.42,15,"IPCC (wet & dry)",-20.2262443438914,-30.316742081448
+"21","Tropical/subtropical all","FOD",45,11.63,9.52,15.01,2.57,2.08,3.23,"Our data (wet & dry)","Tropical/subtropical","Fodder bank",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"22","Tropical/subtropical all","SA",253,38.32,31.6,45.71,3.65,2.32,5.55,"Our data (wet & dry)","Tropical/subtropical","Silvoarable","Silvoarable",22,72.2,60,3.61,33,"IPCC (wet & dry)",-46.9252077562327,1.10803324099723
+"23","Tropical/subtropical all","SP",131,16.82,13.21,22.5,1.89,0.81,2.65,"Our data (wet & dry)","Tropical/subtropical","Silvopasture","Silvopasture",18,58.2,61,2.91,63,"IPCC (wet & dry)",-71.0996563573883,-35.0515463917526
+"24","Tropical/subtropical all","SPC",490,49.6,43.69,55.62,2,1.68,2.7,"Our data (wet & dry)","Tropical/subtropical","Shaded perennial","Shaded perennial",28,48,55,2.4,24,"IPCC (wet & dry)",3.33333333333334,-16.6666666666667
+"25","Tropical/subtropical all","TMC",219,66.65,45.64,87.94,1.74,1.39,2.18,"Our data (wet & dry)","Tropical/subtropical","Tree monocrop",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"26","Tropical/subtropical all","WL",1828,53.95,50.71,57.13,7.56,7.17,7.89,"Our data (wet & dry)","Tropical/subtropical","Woodlot",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"27","Temperate wet","COP",224,24.84,17.25,30.58,0.97,0.76,1.5,"Our data (wet)","Temperate","Coppice","Coppice",NA,12.69,40,3.2,40,"IPCC (wet & dry)",95.7446808510638,-69.6875
+"28","Temperate wet","SA",37,34.32,30.5,40.02,2.52,1.41,3.74,"Our data (wet)","Temperate","Silvoarable","Silvoarable",14,27.3,62,0.91,52,"IPCC (wet & dry)",25.7142857142857,176.923076923077
+"29","Temperate wet","SP",36,80.76,28.91,87.16,1.9,1.14,2.46,"Our data (wet)","Temperate","Silvopasture","Silvopasture",10,69.9,61,2.33,52,"IPCC (wet & dry)",15.5364806866953,-18.4549356223176
+"30","Temperate wet","WL",1121,85.37,78.36,90.34,2.05,1.86,2.59,"Our data (wet)","Temperate","Woodlot",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"31","Temperate dry","COP",346,14.66,12.41,17.8,2.69,2.41,3.02,"Our data (dry)","Temperate","Coppice","Coppice",NA,12.69,40,3.2,40,"IPCC (wet & dry)",15.5240346729708,-15.9375
+"32","Temperate dry","SA",22,22.48,18.97,30.42,1.07,0.67,1.74,"Our data (dry)","Temperate","Silvoarable","Silvoarable",14,27.3,62,0.91,52,"IPCC (wet & dry)",-17.6556776556777,17.5824175824176
+"33","Temperate dry","WL",480,76.41,68.78,86.98,2.02,1.78,2.33,"Our data (dry)","Temperate","Woodlot",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"34","Temperate all","BP",68,35.6,29.28,42.34,5.41,4.15,7.4,"Our data (wet & dry)","Temperate","Boundary planting","Hedgerow",12,26.1,59,0.87,49,"IPCC (wet & dry)",36.3984674329502,521.83908045977
+"35","Temperate all","COP",570,18.97,15.88,20.53,1.25,1.06,1.48,"Our data (wet & dry)","Temperate","Coppice","Coppice",NA,12.69,40,3.2,40,"IPCC (wet & dry)",49.4877856579984,-60.9375
+"36","Temperate all","SA",59,29.66,25.49,35.78,2.18,1.34,3.05,"Our data (wet & dry)","Temperate","Silvoarable","Silvoarable",14,27.3,62,0.91,52,"IPCC (wet & dry)",8.64468864468864,139.56043956044
+"37","Temperate all","SP",44,29.97,23.07,86.9,1.46,0.95,2.21,"Our data (wet & dry)","Temperate","Silvopasture","Silvopasture",10,69.9,61,2.33,52,"IPCC (wet & dry)",-57.1244635193133,-37.3390557939914
+"38","Temperate all","TMC",21,15.75,10.62,23.93,1.26,0.78,2.2,"Our data (wet & dry)","Temperate","Tree monocrop",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"39","Temperate all","WL",1601,84.64,79.81,88.38,1.99,1.89,2.29,"Our data (wet & dry)","Temperate","Woodlot",NA,NA,NA,NA,NA,NA,NA,NA,NA
+"40","Boreal/polar","WL",98,60.59,57.1,65.14,1.21,1.12,1.28,"Our data (wet & dry)","Boreal/polar","Woodlot",NA,NA,NA,NA,NA,NA,NA,NA,NA

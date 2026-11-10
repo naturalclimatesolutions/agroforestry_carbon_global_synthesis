@@ -1,0 +1,41 @@
+c_pool,label1,label2,mean_abs_interaction
+AGC,AF category: Woodlot,Age (years),1.2405447706308277
+AGC,Age (years),Mean annual precipitation (mm),0.8614674415315351
+AGC,Age (years),Clay (%),0.6477834107844075
+AGC,Age (years),Trees per hectare,0.6314864074571578
+AGC,Age (years),Elevation (m),0.5806727679362025
+AGC,Age (years),Mean annual temperature (°C),0.5644430989066779
+AGC,AF category: Woodlot,Clay (%),0.48273910353597227
+AGC,Age (years),Silt (%),0.4058241338926921
+AGC,Age (years),Specific leaf area (mm²/mg),0.3317602726857989
+AGC,AF category: Woodlot,Mean annual temperature (°C),0.3247738761927346
+AGC,AF category: Woodlot,Elevation (m),0.3214543551794749
+AGC,Age (years),Sand (%),0.30457410772324334
+AGC,Age (years),Management: Irrigation = Missing,0.2682317917549736
+AGC,AF category: Woodlot,Trees per hectare,0.2622429841408181
+AGC,AF category: Woodlot,Silt (%),0.2586583168186486
+AGC,AF category: Shaded perennial,AF category: Woodlot,0.256863113128873
+AGC,AF category: Woodlot,Mean annual precipitation (mm),0.23505956788551624
+AGC,Age (years),Ecoregion: Tropical/subtropical dry,0.21934445035807776
+AGC,Age (years),Management: Fertilizer = True,0.21802830535640444
+AGC,Clay (%),Mean annual precipitation (mm),0.19036718788802762
+ΔSOC,Age (years),Mean annual precipitation (mm),0.11499735269090516
+ΔSOC,Age (years),Elevation (m),0.10481903510406745
+ΔSOC,Age (years),Mean annual temperature (°C),0.09287903065512308
+ΔSOC,Control: Other,Elevation (m),0.08982513317583243
+ΔSOC,Elevation (m),Mean annual temperature (°C),0.0817431747969914
+ΔSOC,Age (years),Sand (%),0.07922840381525102
+ΔSOC,Age (years),Silt (%),0.07850972401841935
+ΔSOC,Age (years),Clay (%),0.07821582715533462
+ΔSOC,Elevation (m),Silt (%),0.07594503357068513
+ΔSOC,Elevation (m),Sand (%),0.07152889968797661
+ΔSOC,Specific leaf area (mm²/mg),Elevation (m),0.06239021997648016
+ΔSOC,Avg. vegetation height (m),Silt (%),0.06192501408693419
+ΔSOC,Specific leaf area (mm²/mg),Management: Pruning = True,0.06156347286355391
+ΔSOC,Age (years),Specific leaf area (mm²/mg),0.0587456443781419
+ΔSOC,Specific leaf area (mm²/mg),Silt (%),0.05800229693864459
+ΔSOC,Specific leaf area (mm²/mg),Mean annual temperature (°C),0.05747693493757848
+ΔSOC,Management: Fertilizer = Missing,Elevation (m),0.05603744664956296
+ΔSOC,Mean annual temperature (°C),Silt (%),0.05577334910970916
+ΔSOC,Mean annual precipitation (mm),Mean annual temperature (°C),0.05571303570267474
+ΔSOC,Mean annual precipitation (mm),Silt (%),0.052314556563742245

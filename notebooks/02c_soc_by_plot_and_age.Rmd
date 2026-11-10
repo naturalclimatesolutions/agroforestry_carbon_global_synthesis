@@ -1,0 +1,1184 @@
+---
+title: "02c - Soil organic carbon (SOC) by plot and age"
+output: html_document
+---
+
+**Purpose.** Computes soil organic carbon (SOC) stock and SOC change per plot
+and stand age from the measurements table of the GROA-AF dataset. For each
+plot, SOC is summed across depth strata and harmonized to common depths
+(15, 30, and 60 cm) using the Jobbágy & Jackson cumulative depth distribution.
+The selected depth (`c_varname`, 30 cm by default) is then compared with the
+reference/control values for each soil comparison design (plot/site/study
+reference, chronosequence, and plot change with site reference) to get the
+carbon difference (delta) and the annual rate of change. Records whose
+soil comparison design is recorded as `SOC_change` (change rates reported
+directly by the source study) do not match any of these designs and are
+therefore not included in the output.
+
+**Inputs.**
+
+- `data/groa_af/measurements.csv` (GROA-AF dataset)
+
+**Outputs.**
+
+- `output/intermediate/soc_dep_sum.xlsx`: SOC summed over depth strata per
+  plot and age, with 15/30/60 cm normalized values (re-loaded in this notebook)
+- `output/intermediate/soc_data_out_<c_varname>.xlsx`: SOC stock and change
+  per plot and age. Downstream notebooks (03a, 03b, 10) use
+  `soc_data_out_c_t_ha_norm_30.xlsx`.
+
+```{r setup}
+
+library(here)
+library(tidyverse)
+library(openxlsx)
+
+```
+
+Analysis options: reference vs. agroforestry categories, the normalized depth stratum to analyze, and the k value for depth normalization.
+```{r options}
+
+ref_cats <- c('CROP', 'GRA', 'OTH_CTR')
+
+af_cats <- c('AC', 'BP', 'COP', 'FAL', 'FOD', 'MS', 'OTH_AF', 'PAR', 'RB', 'ROT', 'SA', 'SP', 'SPC', 'TMC', 'WL')
+
+# select normalized depth stratum to analyze
+c_varname <- 'c_t_ha_norm_30'
+
+# k value for Jobbagy equation
+k_value <- 2.0 # typical value from literature
+
+```
+
+Helper functions to parse numeric strings and ranges (e.g. "10 to 20"), soil depth strings, and comma-separated lists.
+```{r helpers}
+parse_num <- function (num_str) {
+  num_str <- num_str %>% str_remove('<') %>% str_remove('>')
+  if (is.na(num_str) || num_str == '') {
+    return(NA)
+  } else if (!is.na(as.numeric(num_str))) {
+    return(as.numeric(num_str))
+  } else if (grepl('to', num_str)) {
+    num_strs <- num_str %>%
+      str_split_1('to') %>%
+      trimws()
+    return(mean(c(as.numeric(num_strs[1]), as.numeric(num_strs[2]))))
+  } else {
+    return(NA)
+  }
+}
+
+parse_depth <- function (dep_str) {
+  if (grepl('to', dep_str)) {
+    dep_strs <- dep_str %>%
+      str_split_1('to') %>%
+      trimws()
+    return(c(as.numeric(dep_strs[1]), as.numeric(dep_strs[2])))
+  }
+  else {
+    return(c(NA, NA))
+  }
+}
+
+# function to compile comma-separated lists of data for output
+make_csl <- function(vec) {
+  csl_all <- paste0(vec, collapse = ', ')
+  vec <- str_split_1(csl_all, pattern = ', ') %>%
+    trimws() %>%
+    unique() %>%
+    sort()
+  return (paste0(vec, collapse = ', '))
+}
+
+```
+
+
+Load SOC and SOC change measurements from the measurements table.
+```{r load-s3}
+
+s3_df <- read.csv(here("data", "groa_af", "measurements.csv"),
+                  colClasses = "character", na.strings = "", fileEncoding = "UTF-8-BOM") %>%
+  select(measurement_id, study_id, site_id, plot_id, af_cat, measurement_year, age_yrs, variable_name, c_pool, c_t_ha, soil_depth_cm, soil_comparison) %>%
+  filter(!(c_t_ha == '' | is.na(c_t_ha))) %>%
+  mutate(ssp_id = paste0(study_id, ';', site_id, ';', plot_id)) %>%
+  filter(c_pool %in% c("SOC", "SOC_change")) %>%
+  filter(!is.na(soil_depth_cm))
+
+```
+
+
+Convert age.yrs and c_t_ha to numeric and parse soil depth into min and max columns.
+```{r parse-cols}
+s3_df <- s3_df %>%
+  rowwise() %>%
+  mutate(age_yrs = parse_num(age_yrs)) %>%
+  mutate(c_t_ha = parse_num(c_t_ha)) %>%
+  mutate(c_t_ha = as.numeric(c_t_ha)) %>%
+  mutate(depth_min = parse_depth(soil_depth_cm)[1]) %>%
+  mutate(depth_max = parse_depth(soil_depth_cm)[2])
+
+```
+
+Functions to normalize SOC to a target depth (Jobbágy & Jackson cumulative depth distribution).
+```{r depth-norm-fns}
+
+# function to estimate cumulative SOC fraction at depth z (from Jobbagy)
+# k = 2 is the standard value for the curve shape
+soc_fraction <- function(z, k = 2) {
+  1 - exp(-k * z)
+}
+
+# function to standardize SOC to a given depth
+normalize_soc <- function(soc_measured, depth_measured_m, 
+                          target_depth_m, k = 2) {
+  f_measured <- soc_fraction(depth_measured_m, k)
+  f_target <- soc_fraction(target_depth_m, k)
+  soc_normalized <- soc_measured * (f_target / f_measured)
+  return(soc_normalized)
+}
+
+```
+
+
+For each plot, af.cat, and age, sum SOC across depth strata (dropping overlapping strata and handling discontinuous ones) and normalize to 15, 30, and 60 cm. Results are saved to `soc_dep_sum.xlsx`.
+```{r sum-depth-strata}
+
+# copy of s3_df but empty
+s3_df_dep_sum <- s3_df[0, ] %>% mutate(dep_flag = '') 
+
+ssp_ids <- s3_df %>% pull(ssp_id) %>% unique()
+
+for (i in 1:length(ssp_ids)) {
+  if (i %% 1000 == 1) {
+    print(paste("Summing depth strata, plots", i, '-', min(length(ssp_ids), i+999),
+                'of', length(ssp_ids)))
+  }
+  
+  pid <- ssp_ids[i]
+  
+  
+  plot_dat <- s3_df %>% 
+    filter(ssp_id == pid) %>%
+    mutate(age_yrs = replace_na(age_yrs, 9999))
+  
+  # if plot_dat contains multiple measurement types, select only one,
+  # to avoid double-counting.  prioritization order = SOC, SOM, soil_perC, SOM_per
+  if ('SOC' %in% plot_dat$variable_name) {
+    plot_dat <- plot_dat %>% filter(variable_name == 'SOC')
+  }
+  if ('SOM' %in% plot_dat$variable_name) {
+    plot_dat <- plot_dat %>% filter(variable_name == 'SOM')
+  }
+  if ('soil_perC' %in% plot_dat$variable_name) {
+    plot_dat <- plot_dat %>% filter(variable_name == 'soil_perC')
+  }
+  if ('SOM_per' %in% plot_dat$variable_name) {
+    plot_dat <- plot_dat %>% filter(variable_name == 'SOM_per')
+  }
+  
+  
+  # first do C
+  plot_dat_c <- plot_dat %>% 
+    filter(c_pool == "SOC")
+  
+  dep_flag <- ''
+  
+  for (my_af_cat in plot_dat_c$af_cat %>% unique()) {
+    
+    rep_age_date <- F
+    # for plot_change/site_ref, reference categories, we need to break 
+    # the data out by year (proxy for age).  we'll encode age as year, and then
+    # reset it at the end
+    if (('plot_change/site_ref' %in% (plot_dat_c %>%
+                                      filter(af_cat == my_af_cat) %>%
+                                      pull(soil_comparison) %>%
+                                      unique())) &&
+        (my_af_cat %in% ref_cats) &&
+        (plot_dat_c %>%
+         filter(af_cat == my_af_cat) %>%
+         pull(measurement_year) %>%
+         unique() %>%
+         length() > 1)) {
+      rep_age_date <- T
+      plot_dat_c <- plot_dat_c %>%
+        mutate(age_yrs = ifelse(soil_comparison == 'plot_change/site_ref', as.numeric(measurement_year), age_yrs))
+    }
+    
+    for (age in plot_dat_c$age_yrs %>% unique()) {
+      plot_dat_filt <- plot_dat_c %>%
+        filter(af_cat == my_af_cat,
+               age_yrs == age) 
+      
+      # record measurement_id for later, then remove it from df
+      my_measurement_ids <- paste0(plot_dat_filt$measurement_id %>% unique(), collapse = ', ')
+      plot_dat_filt <- plot_dat_filt %>% select(-measurement_id)
+      
+      # record date(s) for later, then remove it from df
+      my_dates <- paste0(plot_dat_filt$measurement_year %>% unique(), collapse = ', ')
+      plot_dat_filt <- plot_dat_filt %>% select(-measurement_year)
+      
+      # record soil_comparison for later, then remove it from df
+      soil_comp <- plot_dat_filt$soil_comparison %>% unique() %>% na.omit()
+      plot_dat_filt <- plot_dat_filt %>% select(-soil_comparison)
+      if (length(soil_comp) > 1) {soil_comp <- 'CHECK_multi_soil_comp'}
+      
+      # if there are different particle sizes (denoted by mm or um), 
+      # need to first summarize by adding those together
+      if (nrow(plot_dat_filt %>% filter(grepl('mm|um', variable_name))) > 1) {
+        plot_dat_filt <- plot_dat_filt %>%
+          group_by(soil_depth_cm) %>%
+          mutate(c_t_ha = sum(c_t_ha)) %>%
+          mutate(variable_name = 'SOC') %>%
+          unique()
+      }
+      
+      # if there are multiple measurements for the same depth stratum,
+      # average them
+      plot_dat_filt <- plot_dat_filt %>%
+        group_by(soil_depth_cm) %>%
+        mutate(c_t_ha = mean(c_t_ha)) %>%
+        unique()
+      
+      if (nrow(plot_dat_filt > 0)) {
+        
+        # if there are multiple depth strata, check that they do not overlap
+        # drop strata completely contained within another stratum
+        if (length(plot_dat_filt$soil_depth_cm %>% unique()) > 1) {
+          overlapping_strata <- c()
+          strats <- plot_dat_filt$soil_depth_cm %>% unique()
+          for (strat in strats) {
+            min <- plot_dat_filt %>% filter(soil_depth_cm == strat) %>% pull(depth_min)
+            max <- plot_dat_filt %>% filter(soil_depth_cm == strat) %>% pull(depth_max)
+            for (oth_strat in strats[strats != strat]) {
+              oth_min <- plot_dat_filt %>% filter(soil_depth_cm == oth_strat) %>% pull(depth_min)
+              oth_max <- plot_dat_filt %>% filter(soil_depth_cm == oth_strat) %>% pull(depth_max)
+              if (min <= oth_min && max >= oth_max) {
+                overlapping_strata <- c(overlapping_strata, oth_strat)
+              }
+            }
+          }
+          overlapping_strata <- overlapping_strata %>% unique()
+          plot_dat_filt <- plot_dat_filt %>% filter(!soil_depth_cm %in% overlapping_strata)
+        }
+        
+        # if there are still multiple depth strata, check that they are continuous
+        # (1 apart also acceptable, e.g. 0-10, 11-20, 21-30)
+        if (length(plot_dat_filt$soil_depth_cm %>% unique()) > 1) {
+          depth_mins <- plot_dat_filt$depth_min %>% sort()
+          depth_maxs <- plot_dat_filt$depth_max %>% sort()
+          if (abs(sum(head(depth_maxs, -1) - tail(depth_mins, -1))) >= 
+              nrow(plot_dat_filt)) {
+            # if depths are discontinuous, choose stratum closest to surface
+            plot_dat_filt <- plot_dat_filt %>%
+              filter(depth_min == depth_mins[1],
+                     depth_max == depth_maxs[1])
+          }
+        }
+        
+        depth_min <- min(plot_dat_filt$depth_min)
+        depth_max <- max(plot_dat_filt$depth_max)
+        c_t_ha_sum <- sum(plot_dat_filt$c_t_ha)
+        
+        if (age == 9999) {age <- NA}
+        if (rep_age_date) {age <- NA}
+        
+        my_study_id <- plot_dat_filt$study_id %>% unique()
+        if (length(my_study_id) > 1) {my_study_id <- 'CHECK_multi_study_id'}
+        
+        my_site_id <- plot_dat_filt$site_id %>% unique()
+        if (length(my_site_id) > 1) {my_site_id <- 'CHECK_multi_site_id'}
+        
+        my_plot_id <- plot_dat_filt$plot_id %>% unique()
+        if (length(my_plot_id) > 1) {my_plot_id <- 'CHECK_multi_plot_id'}
+        
+        var_cat_c <- plot_dat_filt$c_pool %>% unique()
+        if (length(var_cat_c) > 1) {var_cat_c <- 'CHECK_multi_var_cat_c'}
+        
+        
+        # calculate depth-normalized C
+        
+        # if min depth is very near surface (<=2cm), we'll assume it's 0
+        if (depth_min <= 2) {depth_min <- 0}
+        
+        # init output vars to NA
+        soc_normalized_15 <- NA
+        soc_normalized_30 <- NA
+        soc_normalized_60 <- NA
+        
+        # must start with surface
+        if (!depth_min == 0) {
+          dep_flag <- 'min_depth_not_0'
+        } else {
+          # calculate each normalized depth strata only if measurement depth is
+          # sufficient that we can reasonably extrapolate (must be >= 1/3 x norm depth)
+          if (depth_max >= 5) {
+            soc_normalized_15 <- normalize_soc(soc_measured = c_t_ha_sum,
+                                               depth_measured_m = depth_max/100,
+                                               target_depth_m = 0.15,
+                                               k = k_value)
+          }
+          if (depth_max >= 10) {
+            soc_normalized_30 <- normalize_soc(soc_measured = c_t_ha_sum,
+                                               depth_measured_m = depth_max/100,
+                                               target_depth_m = 0.3,
+                                               k = k_value)
+          }
+          if (depth_max >= 20) {
+            soc_normalized_60 <- normalize_soc(soc_measured = c_t_ha_sum,
+                                               depth_measured_m = depth_max/100,
+                                               target_depth_m = 0.6,
+                                               k = k_value)
+          }
+        }
+        
+        s3_df_dep_sum <- s3_df_dep_sum %>% 
+          bind_rows(tibble(measurement_id = my_measurement_ids,
+                           study_id = my_study_id,
+                           site_id = my_site_id,
+                           plot_id = my_plot_id,
+                           ssp_id = pid,
+                           af_cat = my_af_cat,
+                           measurement_year = my_dates,
+                           age_yrs = age,
+                           c_pool = var_cat_c,
+                           c_t_ha = c_t_ha_sum,
+                           c_t_ha_norm_15 = soc_normalized_15,
+                           c_t_ha_norm_30 = soc_normalized_30,
+                           c_t_ha_norm_60 = soc_normalized_60,
+                           soil_comparison = soil_comp,
+                           depth_min = depth_min,
+                           depth_max = depth_max,
+                           dep_flag = dep_flag)
+          )
+      }
+    }
+  }
+  
+  
+  # then do C change
+  plot_dat_c_change <- plot_dat %>% 
+    filter(c_pool == "SOC_change")
+  
+  dep_flag <- ''
+  
+  for (my_af_cat in plot_dat_c_change$af_cat %>% unique()) {
+    
+    rep_age_date <- F
+    # for plot_change/site_ref, reference categories, we need to break 
+    # the data out by year (proxy for age).  we'll encode age as year, and then
+    # reset it at the end
+    if (('plot_change/site_ref' %in% (plot_dat_c_change %>%
+                                      filter(af_cat == my_af_cat) %>%
+                                      pull(soil_comparison) %>%
+                                      unique())) &&
+        (my_af_cat %in% ref_cats) &&
+        (plot_dat_c_change %>%
+         filter(af_cat == my_af_cat) %>%
+         pull(measurement_year) %>%
+         unique() %>%
+         length() > 1)) {
+      rep_age_date <- T
+      plot_dat_c_change <- plot_dat_c_change %>%
+        mutate(age_yrs = ifelse(soil_comparison == 'plot_change/site_ref', as.numeric(measurement_year), age_yrs))
+    }
+    
+    for (age in plot_dat_c_change$age_yrs %>% unique()) {
+      plot_dat_filt <- plot_dat_c_change %>%
+        filter(af_cat == my_af_cat,
+               age_yrs == age) 
+      
+      # record measurement_id for later, then remove it from df
+      my_measurement_ids <- paste0(plot_dat_filt$measurement_id %>% unique(), collapse = ', ')
+      plot_dat_filt <- plot_dat_filt %>% select(-measurement_id)
+      
+      # record date(s) for later, then remove date from df
+      my_dates <- paste0(plot_dat_filt$measurement_year %>% unique(), collapse = ', ')
+      plot_dat_filt <- plot_dat_filt %>% select(-measurement_year)
+      
+      # record soil_comparison for later, then remove date from df
+      soil_comp <- plot_dat_filt$soil_comparison %>% unique() %>% na.omit()
+      plot_dat_filt <- plot_dat_filt %>% select(-soil_comparison)
+      if (length(soil_comp) > 1) {soil_comp <- 'CHECK_multi_soil_comp'}
+      
+      # if there are different particle sizes (denoted by mm or um), 
+      # need to first summarize by adding those together
+      if (nrow(plot_dat_filt %>% filter(grepl('mm|um', variable_name))) > 1) {
+        plot_dat_filt <- plot_dat_filt %>%
+          group_by(soil_depth_cm) %>%
+          mutate(c_t_ha = sum(c_t_ha)) %>%
+          mutate(variable_name = 'SOC') %>%
+          unique()
+      }
+      
+      # if there are multiple measurements for the same depth stratum,
+      # average them
+      plot_dat_filt <- plot_dat_filt %>%
+        group_by(soil_depth_cm) %>%
+        mutate(c_t_ha = mean(c_t_ha)) %>%
+        unique()
+      
+      if (nrow(plot_dat_filt > 0)) {
+        
+        # if there are multiple depth strata, check that they do not overlap
+        # drop strata completely contained within another stratum
+        if (length(plot_dat_filt$soil_depth_cm %>% unique()) > 1) {
+          overlapping_strata <- c()
+          strats <- plot_dat_filt$soil_depth_cm %>% unique()
+          for (strat in strats) {
+            min <- plot_dat_filt %>% filter(soil_depth_cm == strat) %>% pull(depth_min)
+            max <- plot_dat_filt %>% filter(soil_depth_cm == strat) %>% pull(depth_max)
+            for (oth_strat in strats[strats != strat]) {
+              oth_min <- plot_dat_filt %>% filter(soil_depth_cm == oth_strat) %>% pull(depth_min)
+              oth_max <- plot_dat_filt %>% filter(soil_depth_cm == oth_strat) %>% pull(depth_max)
+              if (min <= oth_min && max >= oth_max) {
+                overlapping_strata <- c(overlapping_strata, oth_strat)
+              }
+            }
+          }
+          overlapping_strata <- overlapping_strata %>% unique()
+          plot_dat_filt <- plot_dat_filt %>% filter(!soil_depth_cm %in% overlapping_strata)
+        }
+        
+        # if there are still multiple depth strata, check that they are continuous
+        # (1 apart also acceptable, e.g. 0-10, 11-20, 21-30)
+        if (length(plot_dat_filt$soil_depth_cm %>% unique()) > 1) {
+          depth_mins <- plot_dat_filt$depth_min %>% sort()
+          depth_maxs <- plot_dat_filt$depth_max %>% sort()
+          if (abs(sum(head(depth_maxs, -1) - tail(depth_mins, -1))) >= 
+              nrow(plot_dat_filt)) {
+            # if depths are discontinuous, choose stratum closest to surface
+            plot_dat_filt <- plot_dat_filt %>%
+              filter(depth_min == depth_mins[1],
+                     depth_max == depth_maxs[1])
+          }
+        }
+        
+        depth_min <- min(plot_dat_filt$depth_min)
+        depth_max <- max(plot_dat_filt$depth_max)
+        c_t_ha_sum <- sum(plot_dat_filt$c_t_ha)
+        
+        if (age == 9999) {age <- NA}
+        if (rep_age_date) {age <- NA}
+        
+        my_study_id = plot_dat_filt$study_id %>% unique()
+        if (length(my_study_id) > 1) {my_study_id <- 'CHECK_multi_study_id'}
+        
+        my_site_id = plot_dat_filt$site_id %>% unique()
+        if (length(my_site_id) > 1) {my_site_id <- 'CHECK_multi_site_id'}
+        
+        my_plot_id = plot_dat_filt$plot_id %>% unique()
+        if (length(my_plot_id) > 1) {my_plot_id <- 'CHECK_multi_plot_id'}
+        
+        var_cat_c = plot_dat_filt$c_pool %>% unique()
+        if (length(var_cat_c) > 1) {var_cat_c <- 'CHECK_multi_var_cat_c'}
+        
+        
+        # calculate depth-normalized C
+        
+        # if min depth is very near surface (<=2cm), we'll assume it's 0
+        if (depth_min <= 2) {depth_min <- 0}
+        
+        # init output vars to NA
+        soc_normalized_15 <- NA
+        soc_normalized_30 <- NA
+        soc_normalized_60 <- NA
+        
+        # must start with surface
+        if (!depth_min == 0) {
+          dep_flag <- 'min_depth_not_0'
+        } else {
+          # calculate each normalized depth strata only if measurement depth is
+          # sufficient that we can reasonably extrapolate (must be >= .5 x norm depth)
+          if (depth_max >= 7.5) {
+            soc_normalized_15 <- normalize_soc(soc_measured = c_t_ha_sum,
+                                               depth_measured_m = depth_max/100,
+                                               target_depth_m = 0.15,
+                                               k = k_value)
+          }
+          if (depth_max >= 15) {
+            soc_normalized_30 <- normalize_soc(soc_measured = c_t_ha_sum,
+                                               depth_measured_m = depth_max/100,
+                                               target_depth_m = 0.3,
+                                               k = k_value)
+          }
+          if (depth_max >= 30) {
+            soc_normalized_60 <- normalize_soc(soc_measured = c_t_ha_sum,
+                                               depth_measured_m = depth_max/100,
+                                               target_depth_m = 0.6,
+                                               k = k_value)
+          }
+        }
+        
+        s3_df_dep_sum <- s3_df_dep_sum %>% 
+          bind_rows(tibble(measurement_id = my_measurement_ids,
+                           study_id = my_study_id,
+                           site_id = my_site_id,
+                           plot_id = my_plot_id,
+                           ssp_id = pid,
+                           af_cat = my_af_cat,
+                           measurement_year = my_dates,
+                           age_yrs = age,
+                           c_pool = var_cat_c,
+                           c_t_ha = c_t_ha_sum,
+                           c_t_ha_norm_15 = soc_normalized_15,
+                           c_t_ha_norm_30 = soc_normalized_30,
+                           c_t_ha_norm_60 = soc_normalized_60,
+                           soil_comparison = soil_comp,
+                           depth_min = depth_min,
+                           depth_max = depth_max,
+                           dep_flag = dep_flag)
+          )
+      }
+    }
+  }
+}
+
+# no need for variable_name or soil_depth_cm now that we have min and max
+s3_df_dep_sum <- s3_df_dep_sum %>% select(-variable_name, -soil_depth_cm)
+
+write.xlsx(s3_df_dep_sum, here("output", "intermediate", "soc_dep_sum.xlsx"), rowNames = F)
+
+```
+
+
+Re-load the depth sums, keep the normalized depth stratum of interest as `c_t_ha` (dropping the other strata), and drop rows with no value.
+```{r reload-dep-sum}
+
+s3_df_dep_sum <- read.xlsx(here("output", "intermediate", "soc_dep_sum.xlsx")) %>%
+  mutate(c_t_ha = !!sym(c_varname)) %>%
+  select(-c_t_ha_norm_15, -c_t_ha_norm_30, -c_t_ha_norm_60) %>%
+  filter(!is.na(c_t_ha))
+
+```
+
+
+Split rows with multiple plot IDs (e.g. "1/2" or "1, 2") into a separate df; these are matched back to single plots later.
+```{r split-multiplot}
+
+s3_df_dep_sum_multiplot <- s3_df_dep_sum %>%
+  filter(grepl('/|,', plot_id))
+
+s3_df_dep_sum <- s3_df_dep_sum %>%
+  filter(!grepl('/|,', plot_id))
+
+```
+
+
+# Parse each plot and compute c based on soil.comp
+
+Empty output table for per-plot carbon stock and change.
+```{r c-df-setup}
+c_df <- tibble(measurement_id = character(), study_id = character(), site_id = character(), 
+               plot_id = character(), ssp_id = character(), c_pool = character(),
+               measurement_year = character(), age_yrs = numeric(), age_yrs_prev_chron = numeric(),
+               af_cat = character(), ctrl_cat = character(), 
+               depth_min = numeric(), depth_max = numeric(), dep_flag = character(),
+               depth_min_ctrl = numeric(), depth_max_ctrl = numeric(), dep_mismatch_flag = character(),
+               soil_comparison = character(), sc_flag = character(),
+               c_t_ha_af = numeric(), c_t_ha_ctrl = numeric(), ctrl_type = character(), 
+               c_t_ha_af_prev_chron = numeric(), c_t_ha_ctrl_prev_chron = numeric(),
+               c_t_ha_diff_prev_chron = numeric(),
+               c_t_ha_yr = numeric(), c_t_ha_delta = numeric())
+
+```
+
+
+Function to calculate soil comp for plot_ref, site_ref, study_ref designs: compare each row with the reference category (or age 0) at the plot, site, or study level.
+```{r fn-sc-ref}
+
+sc_ref <- function (row_dat, comp_df) {
+  
+  sc_flag <- ''
+  multi_ref <- F
+  
+  # find all possible refs in study_df
+  # search for either a reference cat, or the same cat with age == 0
+  ref_dat <- comp_df %>% filter(af_cat %in% ref_cats | (af_cat == row_dat$af_cat & age_yrs == 0))
+  # if there is more than one row, set multi_ref flag
+  if (nrow(ref_dat) > 1) {multi_ref <- T}
+  # if there are 0 rows, set no_ref flag
+  if (nrow(ref_dat) == 0) {sc_flag = 'no_ref'}
+  
+  if (sc_flag == 'no_ref') {
+    my_ctrl_cat <- NA
+    depth_min_ctrl <- NA
+    depth_max_ctrl <- NA
+    c_t_ha_ctrl <- NA
+  } else if (multi_ref) {
+    ctrl_cats <- ref_dat$af_cat %>% unique()
+    if (length(ctrl_cats) == 1) {
+      my_ctrl_cat <- ctrl_cats
+    } else {
+      my_ctrl_cat <- paste0(ctrl_cats, collapse = ', ')
+    }
+    depth_min_ctrl <- min(ref_dat$depth_min)
+    depth_max_ctrl <- max(ref_dat$depth_max)
+    c_t_ha_ctrl <- mean(ref_dat$c_t_ha)
+  } else { # just one reference
+    my_ctrl_cat <- ref_dat$af_cat
+    depth_min_ctrl <- min(ref_dat$depth_min)
+    depth_max_ctrl <- max(ref_dat$depth_max)
+    c_t_ha_ctrl <- ref_dat$c_t_ha
+  }
+  
+  if (row_dat$c_pool == 'SOC') {
+    c_t_ha_af <- row_dat$c_t_ha
+    c_t_ha_diff <- row_dat$c_t_ha - c_t_ha_ctrl
+    c_t_ha_yr <- c_t_ha_diff / row_dat$age_yrs
+  } else if (row_dat$c_pool == 'SOC_change') {
+    c_t_ha_af <- c_t_ha_ctrl + (row_dat$c_t_ha * row_dat$age_yrs)
+    c_t_ha_diff <- c_t_ha_af - c_t_ha_ctrl
+    c_t_ha_yr <- row_dat$c_t_ha
+  }
+  
+  return (list(my_ctrl_cat = my_ctrl_cat,
+               depth_min_ctrl = depth_min_ctrl,
+               depth_max_ctrl = depth_max_ctrl,
+               c_t_ha_ctrl = c_t_ha_ctrl,
+               c_t_ha_af = c_t_ha_af,
+               c_t_ha_yr = c_t_ha_yr,
+               sc_flag = sc_flag))
+  
+}
+
+```
+
+
+Run soil comp for plot_ref, site_ref, study_ref.
+```{r run-sc-ref}
+
+for (i in 1:nrow(s3_df_dep_sum)) {
+  if (i %% 1000 == 1) {
+    print(paste("Computing rows", i, '-', min(nrow(s3_df_dep_sum), i+999),
+                'of', nrow(s3_df_dep_sum)))
+  }
+  
+  
+  row_dat <- s3_df_dep_sum[i,]
+  
+  sc_dat_ls <- NA
+  
+  
+  # for plot_ref, site ref, and study ref
+  # we only want rows where af_cat is not a control and age is not 0 or NA
+  if (!is.na(row_dat$soil_comparison) &&
+      row_dat$af_cat %in% af_cats &&
+      !is.na(row_dat$age_yrs) &&
+      row_dat$age_yrs > 0) {
+    if (row_dat$soil_comparison == 'plot_ref') {
+      
+      comp_df <- s3_df_dep_sum %>%
+        filter(ssp_id == row_dat$ssp_id)
+      # tack on rows in which plot_id is grepped in s3_df_dep_sum_multiplot
+      comp_df_mp <- s3_df_dep_sum_multiplot %>%
+        filter(grepl(row_dat$plot_id, plot_id),
+               site_id == row_dat$site_id,
+               study_id == row_dat$study_id) %>%
+        mutate(plot_id = row_dat$plot_id,
+               ssp_id = row_dat$ssp_id)
+      
+      sc_dat_ls <- sc_ref(row_dat,
+                          comp_df %>% bind_rows(comp_df_mp))
+    } else if (row_dat$soil_comparison == 'site_ref' || row_dat$soil_comparison == 'site_ref/site_dist_ref') {
+      sc_dat_ls <- sc_ref(row_dat,
+                          comp_df = s3_df_dep_sum %>%
+                            filter(study_id == row_dat$study_id,
+                                   site_id == row_dat$site_id))
+    } else if (row_dat$soil_comparison == 'study_ref') {
+      sc_dat_ls <- sc_ref(row_dat,
+                          s3_df_dep_sum %>%
+                            filter(study_id == row_dat$study_id))
+    }
+    
+  }
+  
+  if (is.list(sc_dat_ls)) {
+    out_row <- row_dat %>% 
+      select(-c_t_ha) %>%
+      mutate(ctrl_cat = sc_dat_ls[['my_ctrl_cat']],
+             depth_min_ctrl = sc_dat_ls[['depth_min_ctrl']],
+             depth_max_ctrl = sc_dat_ls[['depth_max_ctrl']],
+             c_t_ha_ctrl = sc_dat_ls[['c_t_ha_ctrl']],
+             c_t_ha_af = sc_dat_ls[['c_t_ha_af']],
+             c_t_ha_yr = sc_dat_ls[['c_t_ha_yr']],
+             sc_flag = sc_dat_ls[['sc_flag']])
+
+    c_df <- c_df %>% bind_rows(out_row)
+  }
+}
+
+```
+
+
+Function to calculate soil comp for plot_change, site_chrono, study_chrono designs: compute change between consecutive ages (or dates) in the time series, and extrapolate a t0 control by linear regression where possible.
+```{r fn-sc-chrono}
+
+sc_chrono <- function(in_df, sc_lab) {
+  
+  # if there is no age 0, look back at the proper level (plot, site, or 
+  # study).  if there are ref cats with no associated age, assume they are 0
+  if (!0 %in% in_df$age_yrs) {
+    in_df <- in_df %>% 
+      mutate(soil_comparison = ifelse(af_cat %in% ref_cats & is.na(age_yrs), sc_lab, soil_comparison)) %>%
+      mutate(age_yrs = ifelse(af_cat %in% ref_cats & is.na(age_yrs), 0, age_yrs))
+  }
+  
+  in_df <- in_df %>% 
+    filter(soil_comparison == sc_lab) %>%
+    arrange(age_yrs)
+  
+  # there could be multiple af_cats in one study/site
+  # run the analysis for each non-ref af_cat
+  # if there is only one row for a given cat, set sc_flag
+  
+  my_nonref_cats <- in_df %>%
+    filter(grepl(paste(af_cats, collapse = "|"), af_cat)) %>%
+    filter(age_yrs > 0) %>%
+    pull(af_cat) %>%
+    unique()
+  
+  
+  out_df <- c_df[0,]
+  
+  for (cat in my_nonref_cats) {
+    sc_flag <- ''
+    # filter to cat of interest, and also include reference cats (for age 0)
+    df <- in_df %>% filter(af_cat == cat | af_cat %in% ref_cats | age_yrs == 0)
+    if (nrow(df) == 1) {
+      out_row <- df %>%
+        rename(c_t_ha_af = c_t_ha)
+      out_row$sc_flag <- 'invalid_age_reference_this_af.cat'
+      out_df <- out_df %>% bind_rows(out_row)
+      
+    } else {
+      
+      use_date <- F
+      
+      # if there are not a complete set of ages, but there are a complete set of
+      # dates, use date to calculate change
+      if (NA %in% df$age_yrs &&
+          !NA %in% df$measurement_year && 
+          length(df$measurement_year %>% unique()) == nrow(df)) {
+        use_date <- T
+        df <- df %>%
+          rowwise() %>%
+          mutate(measurement_year = parse_num(measurement_year)) %>% 
+          arrange(measurement_year)
+        date_vals <- df$measurement_year %>% unique()
+        df <- df %>%
+          mutate(measurement_year = as.character(measurement_year))
+        # if there are NAs in age_yrs, but removing them still leaves at least two
+        # rows, we can remove the NAs and proceed
+      } else if (NA %in% df$age_yrs &&
+                 nrow(df %>% filter(!is.na(age_yrs))) >= 2) {
+        df <- df %>% filter(!is.na(age_yrs))
+      }
+      # guard against invalid timeseries in both date AND age
+      if (((!use_date) && NA %in% df$age_yrs) ||
+          (use_date && NA %in% df$measurement_year)) {
+        df <- df %>% filter(af_cat == cat)
+        out_row <- df %>%
+          rename(c_t_ha_af = c_t_ha)
+        out_row$sc_flag <- 'invalid_age_reference_this_af.cat'
+        out_df <- out_df %>% bind_rows(out_row)
+      } else {
+        
+        age_vals <- df$age_yrs %>% unique()
+        
+        # if there are multiple rows with the same age (or date if use_date), 
+        # average c_t_ha vals and combine others:
+        # numeric should be the same, character columns using make_csl function
+        
+        df_comb <- df[0,]
+        if (!use_date) {
+          for (age_val in age_vals) {
+            age_df <- df %>%
+              filter(age_yrs == age_val)
+            if (nrow(age_df) == 1) {
+              df_comb <- df_comb %>%
+                bind_rows(age_df)
+            } else {
+              age_df_comb <- age_df[1,]
+              for (col in names(df %>% select_if(is.character))) {
+                age_df_comb[[1,col]] <- make_csl(age_df[[col]])
+              }
+              age_df_comb$c_t_ha <- mean(age_df$c_t_ha)
+              df_comb <- df_comb %>%
+                bind_rows(age_df_comb)
+            }
+          } 
+        } else {
+          for (date_val in date_vals) {
+            date_df <- df %>%
+              filter(measurement_year == date_val)
+            if (nrow(date_df) == 1) {
+              df_comb <- df_comb %>%
+                bind_rows(date_df)
+            } else {
+              date_df_comb <- date_df[1,]
+              for (col in names(df %>% select_if(is.character))) {
+                date_df_comb[[1,col]] <- make_csl(date_df[[col]])
+              }
+              date_df_comb$c_t_ha <- mean(date_df$c_t_ha)
+              df_comb <- df_comb %>%
+                bind_rows(date_df_comb)
+            }
+          }
+        }
+        
+        # fit line to find extrapolated t0 control
+        c_t_ha_ctrl_extrap <- NA
+        if (!use_date) {
+          lm_df <- df_comb %>%
+            filter(!is.na(age_yrs), !is.na(c_t_ha))
+          
+          if (nrow(lm_df) >= 3 && # must have at least 3 values in chronosequnce
+              length(unique(lm_df$age_yrs)) >= 2) { # must have at least 2 unique values
+            lm_fit <- lm(c_t_ha ~ age_yrs, data = lm_df)
+            c_t_ha_ctrl_extrap <- coef(lm_fit)[["(Intercept)"]]
+          } else {
+            sc_flag <- 'insuff_vals_chrono_extrap_ctrl'
+          }
+        } 
+        # set flag if extrapolated value is negative and coerce c_t_ha_ctrl to NA
+        if (!is.na(c_t_ha_ctrl_extrap) && c_t_ha_ctrl_extrap < 0) {
+          c_t_ha_ctrl_extrap <- NA
+          sc_flag <- "neg_extrap_ctrl"
+        }
+
+
+        for (i in 2:nrow(df_comb)) {
+          comp_df <- df_comb[c(i-1, i),]
+          out_row <- df_comb[i,] %>% select(-c_t_ha)
+          out_row$measurement_id <- make_csl(comp_df$measurement_id)
+          out_row$plot_id <- make_csl(comp_df$plot_id)
+          out_row$ssp_id <- make_csl(comp_df$ssp_id)
+          out_row$measurement_year <- make_csl(comp_df$measurement_year)
+          
+          out_row$age_yrs <- comp_df$age_yrs[2]
+          out_row$age_yrs_prev_chron <- comp_df$age_yrs[1]
+
+          out_row$sc_flag <- sc_flag
+          
+          out_row$c_t_ha_af <- comp_df$c_t_ha[2]
+          out_row$c_t_ha_af_prev_chron <- comp_df$c_t_ha[1]
+          out_row$c_t_ha_diff_prev_chron <- out_row$c_t_ha_af - out_row$c_t_ha_af_prev_chron
+          
+          # set control values if there is an age 0 or one of the af.cats is in ref_cats
+          if (0 %in% df_comb$age_yrs ||
+              sum(grepl(paste0(ref_cats, collapse = '|'), df_comb %>% pull(af_cat))) > 1) {
+            ctrl_df <- df_comb %>% 
+              filter(age_yrs == 0 |
+                       grepl(paste0(ref_cats, collapse = '|'), af_cat))
+            if(nrow(ctrl_df) > 1) {
+              sc_flag <- 'multi_ctrl'
+            } else {
+              out_row$ctrl_cat <- ctrl_df$af_cat
+              out_row$depth_min_ctrl <- ctrl_df$depth_min
+              out_row$depth_max_ctrl <- ctrl_df$depth_max
+              out_row$c_t_ha_ctrl <- ctrl_df$c_t_ha
+            }
+          }
+          
+          out_row$c_t_ha_ctrl_extrap <- round(c_t_ha_ctrl_extrap, 3)
+
+          if (use_date) {
+            yrs_diff_prev_chron <- comp_df$measurement_year[2] - comp_df$measurement_year[1]
+          } else {yrs_diff_prev_chron <- comp_df$age_yrs[2] - comp_df$age_yrs[1]}
+          
+          out_row$c_t_ha_yr <- out_row$c_t_ha_diff_prev_chron / yrs_diff_prev_chron
+          
+          out_df <- out_df %>% bind_rows(out_row)
+        }
+      }
+    }
+  }
+  
+  return (out_df)
+}
+
+```
+
+
+Run soil comp for plot_change, site_chrono, study_chrono (including site_chrono/site_ref).
+```{r run-sc-chrono}
+
+for (ssp_id_val in s3_df_dep_sum %>%
+     filter(soil_comparison == 'plot_change') %>%
+     pull(ssp_id) %>%
+     unique()) {
+  
+  comp_df <- s3_df_dep_sum %>%
+    filter(ssp_id == ssp_id_val)
+  
+  # tack on rows in which plot_id is grepped in s3_df_dep_sum_multiplot
+  my_site_id <- str_split_1(ssp_id_val, ';')[2]
+  my_plot_id <- str_split_1(ssp_id_val, ';')[3]
+  comp_df_mp <- s3_df_dep_sum_multiplot %>%
+    filter(grepl(row_dat$plot_id, plot_id),
+           site_id == my_site_id) %>%
+    mutate(plot_id = my_plot_id,
+           ssp_id = ssp_id_val)
+  
+  chrono_df <- sc_chrono(comp_df %>% bind_rows(comp_df_mp),
+                         sc_lab = 'plot_change')
+  
+  c_df <- c_df %>% bind_rows(chrono_df)
+}
+
+
+for (my_site_id in s3_df_dep_sum %>%
+     filter(soil_comparison == 'site_chrono') %>%
+     pull(site_id) %>%
+     unique()) {
+  
+  chrono_df <- sc_chrono(s3_df_dep_sum %>%
+                           filter(site_id == my_site_id),
+                         sc_lab = 'site_chrono')
+  
+  c_df <- c_df %>% bind_rows(chrono_df)
+}
+
+
+for (my_site_id in s3_df_dep_sum %>%
+     filter(soil_comparison == 'site_chrono/site_ref') %>%
+     pull(site_id) %>%
+     unique()) {
+  
+  site_dat <- s3_df_dep_sum %>% filter(site_id == my_site_id)
+  site_af_cats <- site_dat %>% 
+    filter(af_cat %in% af_cats) %>%
+    pull(af_cat) %>%
+    unique()
+  
+  for (my_af_cat in site_af_cats) {
+    chrono_df <- sc_chrono(site_dat %>%
+                             filter(af_cat %in% ref_cats |
+                                      af_cat == my_af_cat),
+                           sc_lab = 'site_chrono/site_ref')
+    
+    c_df <- c_df %>% bind_rows(chrono_df)
+  }
+}
+
+
+for (my_study_id in s3_df_dep_sum %>%
+     filter(soil_comparison == 'study_chrono') %>%
+     pull(study_id) %>%
+     unique()) {
+  
+  chrono_df <- sc_chrono(s3_df_dep_sum %>%
+                           filter(study_id == my_study_id),
+                         sc_lab = 'study_chrono')
+  
+  c_df <- c_df %>% bind_rows(chrono_df)
+}
+
+```
+
+
+Function to calculate soil comp for plot_change/site_ref designs: the change in the agroforestry plot between two dates minus the change in the site reference over the same dates.
+```{r fn-sc-pcsr}
+
+sc_pcsr <- function(in_df, sc_lab) {
+  
+  in_df <- in_df %>% 
+    filter(soil_comparison == sc_lab) %>%
+    arrange(age_yrs)
+  
+  comp_df <- s3_df_dep_sum %>%
+    filter(site_id == in_df$site_id %>% unique(),
+           study_id == in_df$study_id %>% unique(),
+           af_cat %in% ref_cats)
+  
+  in_df_comb <- in_df[0,]
+  comp_df_comb <- in_df[0,]
+  out_df <- c_df[0,]
+  
+  sc_flag <- ''
+  
+  
+  # if there are multiple rows with the same date, 
+  # average c_t_ha vals and combine others:
+  # numeric should be the same, character columns using make_csl function
+  # if there's just one row, need to copy in_df to in_df_comb for output
+  if (nrow(in_df) < 2) {
+    in_df_comb <- in_df
+  } else {
+    for (date_val in in_df$measurement_year %>% unique()) {
+      date_df <- in_df %>%
+        filter(measurement_year == date_val)
+      if (nrow(date_df) == 1) {
+        in_df_comb <- in_df_comb %>%
+          bind_rows(date_df)
+      } else {
+        date_df_comb <- date_df[1,]
+        for (col in names(in_df %>% select_if(is.character))) {
+          date_df_comb[[1,col]] <- make_csl(date_df[[col]])
+        }
+        date_df_comb$c_t_ha <- mean(date_df$c_t_ha)
+        in_df_comb <- in_df_comb %>%
+          bind_rows(date_df_comb)
+      }
+    }
+  }
+  # do the same for comp_df
+  if (nrow(comp_df) < 2) {
+    comp_df_comb <- comp_df
+  } else {
+    for (date_val in comp_df$measurement_year %>% unique()) {
+      date_df <- comp_df %>%
+        filter(measurement_year == date_val)
+      if (nrow(date_df) == 1) {
+        comp_df_comb <- comp_df_comb %>%
+          bind_rows(date_df)
+      } else {
+        date_df_comb <- date_df[1,]
+        for (col in names(comp_df %>% select_if(is.character))) {
+          date_df_comb[[1,col]] <- make_csl(date_df[[col]])
+        }
+        date_df_comb$c_t_ha <- mean(date_df$c_t_ha)
+        comp_df_comb <- comp_df_comb %>%
+          bind_rows(date_df_comb)
+      }
+    }
+  }
+  
+  in_df_comb <- in_df_comb %>% arrange(measurement_year)
+  comp_df_comb <- comp_df_comb %>% arrange(measurement_year)
+  
+  if (!all(in_df_comb$measurement_year %>% unique() %in% comp_df_comb$measurement_year %>% unique())) {
+    sc_flag <- 'pc/sr_comp_date_mismatch'
+  }
+  
+  # if there are less than 2 rows in in_df_comb, can't compute sc
+  if (nrow(in_df_comb) < 2) {
+    sc_flag <- 'insufficient_rows_for_pc/sr'
+    out_row <- in_df_comb[1,] %>% rename(c_t_ha_af = c_t_ha)
+    out_row$sc_flag <- sc_flag
+    return(out_row)
+    
+  } else {
+    
+    for (i in 2:nrow(in_df_comb)) {
+      
+      in_df_filt <- in_df_comb[c(i - 1, i),]
+      comp_df_filt <- comp_df_comb %>% 
+        filter(measurement_year %in% in_df_filt$measurement_year)
+      
+      if (nrow(in_df_filt) != nrow(comp_df_filt)) {
+        sc_flag <- 'pc/sr_date_match_missing'
+      }
+      
+      in_comp_df_filt <- in_df_filt %>% bind_rows(comp_df_filt)
+      
+      out_row <- in_df_comb[i,] %>% select(-c_t_ha)
+      
+      out_row$measurement_id <- make_csl(in_comp_df_filt$measurement_id)
+      out_row$plot_id <- make_csl(in_comp_df_filt$plot_id)
+      out_row$ssp_id <- make_csl(in_comp_df_filt$ssp_id)
+      out_row$measurement_year <- make_csl(in_comp_df_filt$measurement_year)
+      
+      out_row$age_yrs <- in_df_filt$age_yrs[2]
+      out_row$age_yrs_prev_chron <- in_df_filt$age_yrs[1]
+
+      out_row$sc_flag <- sc_flag
+      
+      out_row$c_t_ha_af <- in_df_filt$c_t_ha[2]
+      out_row$c_t_ha_af_prev_chron <- in_df_filt$c_t_ha[1]
+      
+      out_row$c_t_ha_ctrl <- comp_df_filt$c_t_ha[2]
+      out_row$c_t_ha_ctrl_prev_chron <- comp_df_filt$c_t_ha[1]
+      
+      af_c_delt <- out_row$c_t_ha_af - out_row$c_t_ha_af_prev_chron
+      ctrl_c_delt <- out_row$c_t_ha_ctrl - out_row$c_t_ha_ctrl_prev_chron
+      
+      # set control values
+      out_row$ctrl_cat <- make_csl(comp_df_filt$af_cat)
+      out_row$depth_min_ctrl <- comp_df_filt$depth_min[1]
+      out_row$depth_max_ctrl <- comp_df_filt$depth_max[1]
+      
+      c_t_ha_diff <- af_c_delt - ctrl_c_delt
+      
+      yrs_diff <- as.numeric(in_df_filt$measurement_year[2]) - 
+        as.numeric(in_df_filt$measurement_year[1])
+      
+      out_row$c_t_ha_yr <- c_t_ha_diff / yrs_diff
+      
+      out_df <- out_df %>% bind_rows(out_row)
+    }
+    
+    return (out_df)
+  }
+}
+
+```
+
+
+Run soil comp for plot_change/site_ref.
+```{r run-sc-pcsr}
+
+ssp_id_vals <- s3_df_dep_sum %>%
+  filter(soil_comparison == 'plot_change/site_ref',
+         grepl(paste(af_cats, collapse = "|"), af_cat)) %>%
+  pull(ssp_id) %>%
+  unique()
+
+for (ssp_id_val in ssp_id_vals) {
+  
+  
+  ssp_id_df <- s3_df_dep_sum %>%
+    filter(ssp_id == ssp_id_val,
+           soil_comparison == 'plot_change/site_ref')
+  
+  # in a few cases there are site/plots that exist in multiple studies
+  for (my_study_id in ssp_id_df$study_id %>% unique()) {
+    
+    ssp_id_study_df <- ssp_id_df %>%
+      filter(study_id == my_study_id)
+    
+    # tack on rows in which plot_id is grepped in s3_df_dep_sum_multiplot
+    my_site_id <- str_split_1(ssp_id_val, ';')[2]
+    my_plot_id <- str_split_1(ssp_id_val, ';')[3]
+    ssp_id_study_df_mp <- s3_df_dep_sum_multiplot %>%
+      filter(grepl(my_plot_id, plot_id),
+             site_id == my_site_id,
+             study_id == my_study_id) %>%
+      mutate(plot_id = my_plot_id,
+             ssp_id = ssp_id_val)
+    
+    my_c_df <- sc_pcsr(ssp_id_study_df %>% bind_rows(ssp_id_study_df_mp),
+                       sc_lab = 'plot_change/site_ref')
+    
+    c_df <- c_df %>% bind_rows(my_c_df)
+  }
+}
+
+```
+
+
+Compute delta (AF minus control), using the observed control if available and otherwise the extrapolated t0 control.
+```{r compute-delta}
+
+c_df <- c_df %>%
+  mutate(
+    ctrl_type = case_when(
+      !is.na(c_t_ha_ctrl) ~ "observed",
+      is.na(c_t_ha_ctrl) & !is.na(c_t_ha_ctrl_extrap) ~ "extrapolated",
+      TRUE ~ NA_character_),
+    c_t_ha_ctrl = dplyr::coalesce(c_t_ha_ctrl, c_t_ha_ctrl_extrap),
+    c_t_ha_delta = c_t_ha_af - c_t_ha_ctrl
+  ) %>%
+  select(-c_t_ha_ctrl_extrap)
+
+```
+
+
+Write the SOC stock/change table for the selected depth stratum (`c_varname`) to file.
+```{r write-output}
+
+write.xlsx(c_df, paste0(here("output", "intermediate"), "/soc_data_out_", c_varname, ".xlsx"), rowNames = F)
+
+```
+
+

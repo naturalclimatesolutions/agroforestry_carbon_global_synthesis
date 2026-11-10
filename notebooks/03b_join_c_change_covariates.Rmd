@@ -1,0 +1,404 @@
+---
+title: "03b - Join carbon change data with plot-level covariates"
+output: html_document
+params:
+  c_data_name: agc_change
+---
+
+**Purpose.** Joins plot-level carbon *change* (accumulation rate, Mg C/ha/yr)
+data for one carbon pool with site covariates (sites table: country,
+climate/elevation, SoilGrids texture, Audebert ecoregions), plot covariates (01), a
+derived IPCC climate region, and species-level trait data. Comma-separated
+categorical fields are converted into dummy variables, and min/mean/max stand
+age of each change interval is computed. This is the carbon-change counterpart
+of 03a. The carbon pool is selected with the `c_data_name` YAML parameter
+(`'agc_change'`, `'bgc_change'`, or `'soc_change'`); the notebook processes
+one pool per run, so it must be run three times (once per pool) to produce all
+outputs. `run_all.R` does this automatically.
+
+**Inputs.**
+
+- `output/data/agc_change_by_plot_and_age.xlsx` (02a), if `c_data_name == 'agc_change'`
+- `output/data/bgc_change_by_plot_and_age.xlsx` (02b), if `c_data_name == 'bgc_change'`
+- `output/intermediate/soc_data_out_c_t_ha_norm_30.xlsx` (02c), if `c_data_name == 'soc_change'`
+- `output/intermediate/s3_by_plot.xlsx` (01)
+- `data/groa_af/sites.csv` (GROA-AF dataset)
+- `data/species_trait_data.csv` (species traits from TRY)
+
+**Outputs.**
+
+- `output/data/<c_data_name>_by_plot_and_age_w_covars.xlsx`, i.e.
+  `agc_change_`, `bgc_change_`, or `soc_change_by_plot_and_age_w_covars.xlsx`
+  depending on the run
+
+```{r setup}
+
+library(here)
+library(tidyverse)
+library(openxlsx)
+
+```
+
+Options. Set the `c_data_name` parameter (YAML header) to the carbon pool to
+process and re-run the notebook for each of the three pools, or render with
+`rmarkdown::render(..., params = list(c_data_name = 'bgc_change'))`.
+
+```{r options}
+
+# valid options: 'agc_change' (aboveground), 'bgc_change' (belowground), 'soc_change' (soil organic carbon)
+c_data_name <- params$c_data_name
+stopifnot(c_data_name %in% c('agc_change', 'bgc_change', 'soc_change'))
+
+af_cats <- c('AC', 'BP', 'COP', 'FAL', 'FOD', 'MS', 'OTH_AF', 'PAR', 'RB', 'ROT', 'SA', 'SP', 'SPC', 'TMC', 'WL')
+
+```
+
+Load the carbon change data for the selected pool and the covariate datasets.
+```{r load-data}
+
+if (c_data_name %in% c('agc_change', 'bgc_change')) {
+  c_df <- read.xlsx(paste0(here("output", "data"), "/", c_data_name, '_by_plot_and_age.xlsx')) 
+} else if (c_data_name == 'soc_change') {
+  c_df <- read.xlsx(paste0(here("output", "intermediate", "soc_data_out_c_t_ha_norm_30.xlsx"))) %>%
+    filter(sc_flag == '') %>% # filter out cases where pc/sr soil comp failed
+    select(ssp_id, c_t_ha_yr, af_cat, age_yrs, age_yrs_prev_chron, ctrl_cat, depth_min, depth_max)
+}
+
+s3_df <- read.xlsx(here("output", "intermediate", "s3_by_plot.xlsx"))
+
+# Site covariates from the GROA-AF dataset. masl/map/mat are harmonized there:
+# the study value (midpoint of ranges) or, where not reported, the WorldClim /
+# elevation backfill. SoilGrids texture is used below where plot-level texture is
+# missing. Ecoregions come from the Audebert et al. (2024) zones.
+s2_df <- read.csv(here("data", "groa_af", "sites.csv"), na.strings = "", fileEncoding = "UTF-8-BOM",
+                  colClasses = c(site_id = "character")) %>%
+  select(site_id, country, masl, map, mat,
+         sand_bf = sand_pct_soilgrids, silt_bf = silt_pct_soilgrids,
+         clay_bf = clay_pct_soilgrids, tex_class_bf = soil_texture_class_soilgrids,
+         audebert_zone, ecoregion = audebert_ecoregion_5class)
+
+```
+
+Helper functions for parsing numeric strings (e.g. ranges like "10 to 20") and for cleaning comma-separated lists.
+```{r helpers}
+
+parse_num <- function (num_str) {
+  num_str <- num_str %>% str_remove('<') %>% str_remove('>')
+  if (is.na(num_str) || num_str == '') {
+    return(NA)
+  } else if (!is.na(as.numeric(num_str))) {
+    return(as.numeric(num_str))
+  } else if (grepl('to', num_str)) {
+    num_strs <- num_str %>%
+      str_split_1('to') %>%
+      trimws()
+    return(mean(c(as.numeric(num_strs[1]), as.numeric(num_strs[2]))))
+  } else {
+    return(NA)
+  }
+}
+
+# function to compile comma-separated lists of data for output
+make_csl <- function(vec) {
+  csl_all <- paste0(vec, collapse = ', ')
+  vec <- str_split_1(csl_all, pattern = ', ') %>%
+    trimws() %>%
+    unique() %>%
+    sort()
+  vec <- vec[!is.na(vec) & vec != 'NA' & vec != '']
+  return (paste0(vec, collapse = ', '))
+}
+
+filter_prior_cats <- function(str, prior_cat_vec = valid_prior_cats) {
+  vec <- str_split_1(str, pattern = ', ')
+  vec <- vec[vec %in% prior_cat_vec]
+  return (paste0(vec, collapse = ', '))
+}
+
+
+```
+
+
+Join the plot covariates (01) and site covariates (sites table) to the carbon data.
+```{r merge}
+
+s2_df_merge <- s2_df
+
+# special case for soc chronosequences, because could have multiple plots
+# workaround - use the first ssp_id that is present in s3_df for joins
+# (the first listed plot is not always in s3_df, which dropped all site covariates)
+# should be ok since covar data should be consistent between chronos
+pick_first_csl <- function(csl_str) {
+  elements <- str_split_1(csl_str, ', ') %>% trimws()
+  in_s3 <- elements[elements %in% s3_df$ssp_id]
+  return (if (length(in_s3) > 0) in_s3[1] else elements[1])
+}
+if (c_data_name == 'soc_change') {
+  c_df <- c_df %>%
+    rowwise() %>%
+    mutate(ssp_id_mult = ssp_id,
+           ssp_id = pick_first_csl(ssp_id))
+}
+
+comb_df <- c_df %>%
+  left_join(s3_df %>% select(-af_cat), by = "ssp_id") %>% # drop the af_cat duplicate
+  left_join(s2_df_merge, by = "site_id") %>%
+  arrange(ssp_id) %>%
+  ungroup() %>%
+  mutate(row_id = row_number())
+
+
+```
+
+
+# Codify IPCC climate region using MAP/MAT/MASL
+See https://www.ipcc-nggip.iges.or.jp/public/2019rf/corrigenda1.html and https://www.ipcc-nggip.iges.or.jp/public/2019rf/pdf/4_Volume4/19R_V4_Ch03_Land%20Representation.pdf for methods.
+Using simplified methods to generate categories found in https://www.ipcc-nggip.iges.or.jp/public/gpglulucf/gpglulucf_files/Chp3/Chp3_3_Cropland.pdf, Table 3.3.2.
+```{r ipcc-region}
+
+gen_ipcc_reg <- function(mat, map, masl) {
+  if (any(is.na(c(mat, map, masl)))) {
+    return(NA)
+  }
+  if (mat > 18) {
+    if (masl > 1000) {
+      return('tropical_montane')
+    }
+    if (map > 2000) {
+      return ('tropical_wet')
+    }
+    if (map > 1000) {
+      return('tropical_moist')
+    }
+    return('tropical_dry')
+  }
+  if (mat > 0) {
+    return ('temperate')
+  }
+  return ('boreal/polar')
+}
+
+comb_df <- comb_df %>%
+  rowwise() %>%
+  mutate(ipcc_reg = gen_ipcc_reg(mat, map, masl))
+
+
+```
+
+
+Backfill soil texture percents and class where missing.
+```{r soil-tex-backfill}
+
+comb_df <- comb_df %>%
+  rowwise() %>%
+  mutate(soil_texture_class = 
+           ifelse(is.na(soil_texture_class) || soil_texture_class == '', 
+                  tex_class_bf, soil_texture_class),
+         sand_pct_mean = coalesce(sand_pct_mean, sand_bf),
+         silt_pct_mean = coalesce(silt_pct_mean, silt_bf),
+         clay_pct_mean = coalesce(clay_pct_mean, clay_bf)) %>%
+  select(-c(tex_class_bf, sand_bf, silt_bf, clay_bf))
+
+```
+
+
+Merge prior land-use categories (`prior_land_use`) with the year-0 AF category (`af_cat_y0`, AGC/BGC only) and keep only valid prior categories.
+```{r prior-cats}
+
+valid_prior_cats <- s3_df %>% pull(prior_land_use) %>% unique() %>% make_csl() %>% str_split_1(pattern = ', ')
+
+
+if (c_data_name %in% c('agc_change', 'bgc_change')) {
+  af_cats_y0 <- c_df %>% pull(af_cat_y0) %>% unique() %>% make_csl() %>% str_split_1(pattern = ', ')
+  valid_prior_cats <- make_csl(c(valid_prior_cats, af_cats_y0)) %>% str_split_1(pattern = ', ')
+}
+
+valid_prior_cats <- valid_prior_cats[valid_prior_cats != 'NO_MATCH']
+
+if (c_data_name %in% c('agc_change', 'bgc_change')) {
+comb_df <- comb_df %>%
+  rowwise() %>%
+  mutate(prior_land_use = make_csl(c(prior_land_use, af_cat_y0)))
+}
+
+comb_df <- comb_df %>%
+  rowwise() %>%
+  mutate(prior_land_use = make_csl(prior_land_use)) %>%
+  mutate(prior_land_use = filter_prior_cats(prior_land_use))
+
+```
+
+Convert comma-separated categorical columns to dummy variables.
+```{r dummy-vars}
+
+# prior land use
+comb_df_prior_dummy <- comb_df %>%
+  select(row_id, prior_land_use) %>%
+  separate_rows(prior_land_use, sep = ", ") %>%
+  mutate(prior_land_use = trimws(prior_land_use)) %>%
+  filter(prior_land_use != "") %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = prior_land_use, values_from = value, 
+              values_fill = NA, names_prefix = "prior_")
+
+# control (for SOC only)
+if (c_data_name == 'soc_change') {
+  comb_df_ctrl_dummy <- comb_df %>%
+    select(row_id, ctrl_cat) %>%
+    separate_rows(ctrl_cat, sep = ", ") %>%
+    mutate(ctrl_cat = trimws(ctrl_cat)) %>%
+    filter(ctrl_cat != "") %>%
+    mutate(value = 1) %>%
+    pivot_wider(names_from = ctrl_cat, values_from = value, 
+                values_fill = NA, names_prefix = "ctrl_")
+}
+
+# soil texture
+comb_df_soiltex_dummy <- comb_df %>%
+  select(row_id, soil_texture_class) %>%
+  separate_rows(soil_texture_class, sep = ", ") %>%
+  mutate(soil_texture_class = trimws(soil_texture_class)) %>%
+  filter(soil_texture_class != "") %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = soil_texture_class, values_from = value, 
+              values_fill = NA, names_prefix = "soil_tex_")
+
+```
+
+Join species trait data (from the TRY database), averaging continuous traits across all AF species in each plot.
+```{r species-traits}
+
+trait_df <- read.csv(here("data", "species_trait_data.csv"))
+
+for (i in 1:nrow(comb_df)) {
+  my_row <- comb_df[i,]
+  if (! is.na(my_row$species_af)) {
+    my_specs <- my_row$species_af %>% str_split_1(', ') %>% trimws()
+    my_specs_trait_df <- trait_df %>% filter(AccSpeciesName %in% my_specs)
+    comb_df[i,'avg_veg_height_m'] <- mean(my_specs_trait_df$veg_height_m, na.rm = T) %>% round(2)
+    comb_df[i,'avg_wood_dens_g_cm3'] <- mean(my_specs_trait_df$wood_dens_g_cm3, na.rm = T) %>% round(2)
+    comb_df[i,'avg_leaf_area_mm2_mg'] <- mean(my_specs_trait_df$leaf_area_mm2_mg, na.rm = T) %>% round(2)
+    comb_df[i,'avg_root_depth_m'] <- mean(my_specs_trait_df$root_depth_m, na.rm = T) %>% round(2)
+    comb_df[i,'n_fix_bin'] <- ifelse('Yes' %in% my_specs_trait_df$n_fix_bin, 1, 
+                                     ifelse('No' %in% my_specs_trait_df$n_fix_bin, 0,
+                                            NA))
+    comb_df[i,'myco_fungi_am'] <- ifelse('Yes' %in% my_specs_trait_df$myco_fungi_am, 1, 
+                                         ifelse('No' %in% my_specs_trait_df$myco_fungi_am, 0,
+                                                NA))
+    comb_df[i,'myco_fungi_ecm'] <- ifelse('Yes' %in% my_specs_trait_df$myco_fungi_ecm, 1, 
+                                          ifelse('No' %in% my_specs_trait_df$myco_fungi_ecm, 0,
+                                                 NA))
+    comb_df[i,'freezing_exposed'] <- ifelse('Yes' %in% my_specs_trait_df$freezing_exposed, 1, 
+                                            ifelse('No' %in% my_specs_trait_df$freezing_exposed, 0,
+                                                   NA))
+    comb_df[i,'resprout_after_fire'] <- ifelse('Yes' %in% my_specs_trait_df$resprout_after_fire, 1, 
+                                               ifelse('No' %in% my_specs_trait_df$resprout_after_fire, 0,
+                                                      NA))
+  }
+}
+
+```
+
+Compute min/mean/max stand age of each change interval, select the output columns for the selected pool, add the dummy variables, and write the combined dataset.
+```{r final-output}
+
+# interpret ages for soc_change
+if (c_data_name == 'soc_change') {
+  comb_df <- comb_df %>%
+    rowwise() %>%
+    mutate(age_max = age_yrs,
+           age_min = ifelse(is.na(age_yrs_prev_chron), 0, age_yrs_prev_chron))
+}
+
+comb_df <- comb_df %>%
+  rowwise() %>%
+  mutate(age_mean = mean(c(age_min, age_max)))
+
+# select fields specific to c_data type
+if (c_data_name == 'agc_change') {
+  final_df <- comb_df %>%
+    select(row_id, ssp_id, c_t_ha_yr, source,
+           af_cat, age_min, age_mean, age_max, prior_land_use,
+           country,
+           ipcc_reg, audebert_zone, ecoregion,
+           trees_per_ha = trees_per_ha_mean, 
+           masl, map, mat, 
+           soil_texture_class,
+           sand_pct = sand_pct_mean,
+           silt_pct = silt_pct_mean,
+           clay_pct = clay_pct_mean, 
+           af_diversity = af_diversity_mean,
+           species_af,
+           genera_af,
+           pruning, weed_control, tillage, 
+           pest_control, burning, litter_management, 
+           fertilizer, irrigation, grazing,
+           avg_veg_height_m, avg_wood_dens_g_cm3,
+           avg_leaf_area_mm2_mg, avg_root_depth_m,
+           n_fix_bin, myco_fungi_am, myco_fungi_ecm,
+           freezing_exposed, resprout_after_fire)
+} else if (c_data_name == 'bgc_change') {
+  final_df <- comb_df %>%
+    select(row_id, ssp_id, c_t_ha_yr, source,
+           depth_min, depth_max,
+           af_cat, age_min, age_mean, age_max, prior_land_use,
+           country,
+           ipcc_reg, audebert_zone, ecoregion,
+           trees_per_ha = trees_per_ha_mean, 
+           masl, map, mat, 
+           soil_texture_class,
+           sand_pct = sand_pct_mean,
+           silt_pct = silt_pct_mean,
+           clay_pct = clay_pct_mean, 
+           af_diversity = af_diversity_mean,
+           species_af,
+           genera_af,
+           pruning, weed_control, tillage, 
+           pest_control, burning, litter_management, 
+           fertilizer, irrigation, grazing,
+           avg_veg_height_m, avg_wood_dens_g_cm3,
+           avg_leaf_area_mm2_mg, avg_root_depth_m,
+           n_fix_bin, myco_fungi_am, myco_fungi_ecm,
+           freezing_exposed, resprout_after_fire) 
+} else if (c_data_name == 'soc_change') {
+  final_df <- comb_df %>%
+    select(row_id, ssp_id, ssp_id_mult, c_t_ha_yr, 
+           depth_min, depth_max,
+           af_cat, age_min, age_mean, age_max, 
+           prior_land_use,  ctrl_cat,
+           country,
+           ipcc_reg, audebert_zone, ecoregion,
+           trees_per_ha = trees_per_ha_mean, 
+           masl, map, mat, 
+           soil_texture_class,
+           sand_pct = sand_pct_mean,
+           silt_pct = silt_pct_mean,
+           clay_pct = clay_pct_mean, 
+           af_diversity = af_diversity_mean,
+           species_af,
+           genera_af,
+           pruning, weed_control, tillage, 
+           pest_control, burning, litter_management, 
+           fertilizer, irrigation, grazing,
+           avg_veg_height_m, avg_wood_dens_g_cm3,
+           avg_leaf_area_mm2_mg, avg_root_depth_m,
+           n_fix_bin, myco_fungi_am, myco_fungi_ecm,
+           freezing_exposed, resprout_after_fire) 
+}
+
+final_df <- final_df %>%
+  left_join(comb_df_prior_dummy) %>%
+  left_join(comb_df_soiltex_dummy) %>%
+  mutate(across(everything(), ~replace(., is.nan(.), NA))) # replace NaN with NA for output formatting
+
+if (c_data_name == 'soc_change') {
+  final_df <- final_df %>%
+  left_join(comb_df_ctrl_dummy) %>%
+    rowwise() %>%
+    mutate(ssp_id = ssp_id_mult) %>% # reset ssp_id to version that may include multiple
+    select(-ssp_id_mult)
+}
+
+write.xlsx(final_df, paste0(here("output", "data"), "/", c_data_name, '_by_plot_and_age_w_covars.xlsx'))
+
+```

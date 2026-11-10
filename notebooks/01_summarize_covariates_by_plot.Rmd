@@ -1,0 +1,194 @@
+---
+title: "01 - Summarize measurement covariates by plot"
+output: html_document
+---
+
+**Purpose.** Summarize all non-carbon measurement covariates from the measurements table of the GROA-AF dataset to one row per study/site/plot (`ssp_id`), restricted to agroforestry categories. Numeric variables (age, tree density, bulk density, soil texture, AF diversity) are summarized as min/max/mean, categorical variables as sorted comma-separated lists of unique values, and binary management variables as their maximum. Soil texture means are normalized so that sand + silt + clay = 100. Carbon measurements are handled in notebooks 02a-02c and joined with these covariates in notebooks 03a/03b.
+
+**Inputs.**
+
+- `data/groa_af/measurements.csv` (GROA-AF dataset)
+
+**Outputs.**
+
+- `output/intermediate/s3_by_plot.xlsx`
+
+```{r setup}
+library(here)
+library(tidyverse)
+library(openxlsx)
+```
+
+Load the measurements table, keep covariate columns, build the plot ID (`ssp_id`), and filter to agroforestry categories.
+```{r load-s3}
+
+af_cats <- c('AC', 'BP', 'COP', 'FAL', 'FOD', 'MS', 'OTH_AF', 'PAR', 'RB', 'ROT', 'SA', 'SP', 'SPC', 'TMC', 'WL')
+
+
+s3_df <- read.csv(here("data", "groa_af", "measurements.csv"),
+                  colClasses = "character", na.strings = "", fileEncoding = "UTF-8-BOM") %>%
+  select(measurement_id, study_id, site_id, plot_id, plot_name,
+         prior_land_use, af_cat_as_given, af_cat, measurement_year, age_yrs, c_pool,
+         trees_per_ha, bulk_density_g_cm3, soil_texture_class,
+         sand_pct, silt_pct, clay_pct,
+         species_af, genera_af, af_diversity, crop, crop_fao_code,
+         pruning, weed_control, tillage, pest_control, burning, litter_management,
+         fertilizer, irrigation, grazing) %>%
+  mutate(ssp_id = paste0(study_id, ';', site_id, ';', plot_id)) %>%
+  select(ssp_id, everything()) %>%
+  filter(grepl(paste0(af_cats, collapse = '|'), af_cat))
+
+```
+
+Helper functions for parsing numeric strings (incl. ranges like "5 to 10") and compiling comma-separated lists.
+```{r helpers}
+parse_num <- function (num_str) {
+  num_str <- num_str %>% str_remove('<') %>% str_remove('>')
+  if (is.na(num_str) || num_str == '') {
+    return(NA)
+  } else if (!is.na(as.numeric(num_str))) {
+    return(as.numeric(num_str))
+  } else if (grepl('to', num_str)) {
+    num_strs <- num_str %>%
+      str_split_1('to') %>%
+      trimws()
+    return(mean(c(as.numeric(num_strs[1]), as.numeric(num_strs[2]))))
+  } else {
+    return(NA)
+  }
+}
+
+parse_depth <- function (dep_str) {
+  if (grepl('to', dep_str)) {
+    dep_strs <- dep_str %>%
+      str_split_1('to') %>%
+      trimws()
+    return(c(as.numeric(dep_strs[1]), as.numeric(dep_strs[2])))
+  }
+  else {
+    return(c(NA, NA))
+  }
+}
+
+# function to compile comma-separated lists of data for output
+make_csl <- function(vec) {
+  csl_all <- paste0(vec, collapse = ', ')
+  vec <- str_split_1(csl_all, pattern = ', ') %>%
+    trimws() %>%
+    unique() %>%
+    sort()
+  vec <- vec[!is.na(vec) & vec != 'NA']
+  return (paste0(vec, collapse = ', '))
+}
+
+```
+
+
+Parse numeric columns (stored as text) as actual numeric values.
+```{r parse-numeric}
+
+s3_df <- s3_df %>%
+  rowwise() %>%
+  mutate(age_yrs = parse_num(age_yrs)) %>%
+  mutate(trees_per_ha = parse_num(trees_per_ha)) %>%
+  mutate(bulk_density_g_cm3 = parse_num(bulk_density_g_cm3)) %>%
+  mutate(af_diversity = parse_num(af_diversity)) %>%
+  mutate(sand_pct = parse_num(sand_pct)) %>%
+  mutate(silt_pct = parse_num(silt_pct)) %>%
+  mutate(clay_pct = parse_num(clay_pct))
+
+
+```
+
+
+For each plot (`ssp_id`), compute min/max/mean for numeric vars, comma-separated lists for categorical vars, and the max for binary management vars; then normalize soil texture means.
+```{r summarize-by-plot}
+
+num_cols <- s3_df %>% select(where(is.numeric)) %>% names()
+bin_cols <- c('pruning', 'weed_control', 'tillage', 'pest_control', 'burning', 
+              'litter_management', 'fertilizer', 'irrigation', 'grazing')
+char_cols <- s3_df %>% select(where(is.character)) %>% select(-bin_cols) %>% names()
+
+safe_max <- function(x) if (length(x) == 0 || all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+
+out_df <- s3_df[0,] %>%
+  mutate(age_yrs_min = numeric(),
+         age_yrs_max = numeric(),
+         age_yrs_mean = numeric(),
+         trees_per_ha_min = numeric(),
+         trees_per_ha_max = numeric(),
+         trees_per_ha_mean = numeric(),
+         bulk_density_g_cm3_min = numeric(),
+         bulk_density_g_cm3_max = numeric(),
+         bulk_density_g_cm3_mean = numeric(),
+         sand_pct_min = numeric(),
+         sand_pct_mean = numeric(),
+         sand_pct_max = numeric(),
+         silt_pct_min = numeric(),
+         silt_pct_mean = numeric(),
+         silt_pct_max = numeric(),
+         clay_pct_min = numeric(),
+         clay_pct_mean = numeric(),
+         clay_pct_max = numeric(),
+         af_diversity_min = numeric(),
+         af_diversity_max = numeric(),
+         af_diversity_mean = numeric(),
+         pruning = numeric(),
+         weed_control = numeric(),
+         tillage = numeric(),
+         pest_control = numeric(),
+         burning = numeric(),
+         litter_management = numeric(),
+         fertilizer = numeric(),
+         irrigation = numeric(),
+         grazing = numeric()
+  ) %>%
+  select(-c(age_yrs, trees_per_ha, bulk_density_g_cm3, af_diversity, 
+            sand_pct, silt_pct, clay_pct))
+
+ids <- s3_df$ssp_id %>% unique()
+for (i in 1:length(ids)) {
+  if (i %% 1000 == 1) {
+    print(paste("Computing plot", i, '-', min(length(ids), i+999),
+                'of', length(ids)))
+  }
+  id <- ids[i]
+  plot_df <- s3_df %>% filter(ssp_id == id)
+  for (col in num_cols) {
+    vec <- plot_df %>% pull(col) %>% na.omit()
+    if (length(vec) > 0) {
+    out_df[i, paste0(col, '_min')] <- min(vec, na.rm = T)
+    out_df[i, paste0(col, '_max')] <- max(vec, na.rm = T)
+    out_df[i, paste0(col, '_mean')] <- mean(vec, na.rm = T)
+    }
+  }
+  for (col in char_cols) {
+    out_df[i, col] <- plot_df %>% pull(col) %>% make_csl
+  }
+  for (col in bin_cols) {
+    vals <- plot_df %>% pull(col) %>% as.numeric()
+    out_df[i, col] <- safe_max(vals)
+  }
+  
+}
+
+# normalize sand + silt + clay = 100
+out_df <- out_df %>%
+  mutate(
+    # compute row-wise sum only when all three values are present
+    row_sum = rowSums(pick(sand_pct_mean, silt_pct_mean, clay_pct_mean), na.rm = FALSE),
+    # divide each column by the row_sum (NA row_sum leaves values unchanged)
+    across(c(sand_pct_mean, silt_pct_mean, clay_pct_mean), 
+           ~ ifelse(!is.na(row_sum) & row_sum > 0, 100 * .x / row_sum, .x))
+  ) %>%
+  select(-c(row_sum, sand_pct_min, sand_pct_max, silt_pct_min, silt_pct_max, 
+            clay_pct_min, clay_pct_max))
+
+```
+
+Write the plot-level summary to file.
+```{r write-output}
+
+write.xlsx(out_df, here("output", "intermediate", "s3_by_plot.xlsx"), rowNames = F)
+
+```

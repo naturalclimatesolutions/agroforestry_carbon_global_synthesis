@@ -1,0 +1,1250 @@
+---
+title: "05 - Bivariate analyses and descriptive figures"
+output: html_document
+---
+
+**Purpose.** Produces descriptive figures of the GROA-AF carbon data (carbon and age distributions, carbon vs. system age, carbon by agroforestry category and ecoregion) and fits bivariate models of each carbon pool (AGC, BGC, ΔSOC and their annual change rates) against each candidate predictor. Continuous predictors use simple linear regression; binary and categorical predictors use one-way linear models with effect (sum-to-zero) contrasts against the grand mean. The model summaries feed the predictor summary table (notebook 07) and the random forest analysis (notebook 10).
+
+**Inputs.** (all produced by notebook 04)
+
+- `output/data/{agc,bgc,soc}_by_plot_and_age_w_covars_drop_outliers.xlsx`
+- `output/data/{agc,bgc,soc}_change_by_plot_and_age_w_covars_drop_outliers.xlsx`
+
+**Outputs.**
+
+- `output/figures/age_density.png`
+- `output/figures/c_density_by_age_panel.png`
+- `output/figures/c_by_age_scatter_panel.png`
+- `output/figures/c_by_cat_violin_panel.png`
+- `output/figures/c_by_ecoreg_violin_panel.png`
+- `output/tables/bivariate_model_summaries.xlsx` (one sheet per predictor type, plus a Notes sheet)
+- `output/tables/bivariate_model_summaries_long.csv` (used by notebooks 06 and 09)
+
+
+```{r setup}
+library(here)
+library(tidyverse)
+library(openxlsx)
+library(skimr)
+library(ggpmisc)
+library(patchwork)
+library(forcats)
+library(broom)
+library(emmeans)
+```
+
+Load the final analysis datasets (outliers removed) for each carbon pool, produced by notebook 05.
+```{r load-data}
+agc_df <- read.xlsx(here("output", "data", "agc_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+agc_change_df <- read.xlsx(here("output", "data", "agc_change_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+bgc_df <- read.xlsx(here("output", "data", "bgc_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+bgc_change_df <- read.xlsx(here("output", "data", "bgc_change_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+soc_df <- read.xlsx(here("output", "data", "soc_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+soc_change_df <- read.xlsx(here("output", "data", "soc_change_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+```
+
+
+## Options and labels
+
+Analysis options, agroforestry category lookups, and plot/table labels.
+```{r options}
+# Select whether to use SOC stock or delta from baseline
+use_soc_delta <- T
+
+af_cats <- c('AC', 'BP', 'COP', 'FAL', 'FOD', 'MS', 'OTH_AF', 'PAR', 'RB', 'ROT', 'SA', 'SP', 'SPC', 'TMC', 'WL')
+
+af_cat_labels <- c('AC' = "Alley cropping", 
+                   'BP' = 'Boundary planting', 
+                   'COP' = 'Coppice', 
+                   'FAL' = 'Fallows', 
+                   'FOD' = 'Fodder bank',
+                   'MS' = 'Multistrata', 
+                   'OTH_AF' = 'Other Agroforestry',
+                   'PAR' = 'Parklands', 
+                   'RB' = 'Riparian Buffer', 
+                   'ROT' = 'Rotational', 
+                   'SA' = 'Silvoarable', 
+                   'SP' = 'Silvopasture', 
+                   'SPC' = 'Shaded perennial',
+                   'TMC' = 'Tree monocrop', 
+                   'WL' = 'Woodlot')
+
+c_data_names <- c('agc', 'bgc', 'soc', 'agc_change', 'bgc_change', 'soc_change')
+c_data_labels <- c('agc' = "AGC", 'bgc' = "BGC", 'soc' = expression(Delta * "SOC"), 'agc_change' = "AGC change", 'bgc_change' = "BGC change", 'soc_change' = expression(Delta * "SOC change"))
+
+# Plain-text labels for the "c_pool" column in output tables (not plotmath
+# expressions like c_data_labels). SOC is labeled "\u0394SOC" when
+# use_soc_delta is selected, since c_t_ha is then the delta from baseline.
+c_pool_labels <- c('agc' = "AGC",
+                    'bgc' = "BGC",
+                    'soc' = if (use_soc_delta) "\u0394SOC" else "SOC",
+                    'agc_change' = "AGC change",
+                    'bgc_change' = "BGC change",
+                    'soc_change' = "\u0394SOC change")
+dep_var_labels <- c('c_t_ha' = expression(C~stock~(Mg~ha^{-1})), 'c_t_ha_yr' = expression(C~change~(Mg~ha^{-1}~yr^{-1})))
+```
+
+
+If `use_soc_delta` is TRUE, replace SOC stock (`c_t_ha`) with the AF-minus-control delta (`c_t_ha_delta`) so downstream code needs no changes.
+```{r soc-delta}
+if (use_soc_delta) {
+  soc_df <- soc_df %>%
+    mutate(c_t_ha = c_t_ha_delta) %>%
+    select(-c_t_ha_delta)
+}
+```
+
+
+Predictor sets used in the bivariate models.
+```{r predictor-sets}
+cont_vars <- c('age', 'age_mean', 'trees_per_ha', 'masl', 'map', 'mat', 
+               'sand_pct', 'silt_pct', 'clay_pct', 'af_diversity', 
+               'avg_veg_height_m', 'agv_wood_dens_g_cm3', 'avg_leaf_area_mm2_mg')
+
+bin_vars <- c('pruning', 'weed_control', 'tillage', 'pest_control', 'burning', 
+              'litter_management', 'fertilizer', 'irrigation', 'grazing',
+              'n_fix_bin', 'myco_fungi_am', 'myco_fungi_ecm', 
+              'freezing_exposed', 'resprout_after_fire')
+
+mgmt_vars <- c('pruning', 'weed_control', 'tillage', 'pest_control', 'burning', 
+               'litter_management', 'fertilizer', 'irrigation', 'grazing')
+
+trait_vars <- c('n_fix_bin', 'myco_fungi_am', 'myco_fungi_ecm', 
+                'freezing_exposed', 'resprout_after_fire')
+
+# plus af_cat, prior_*, soil_tex_*, ctrl_*
+
+dummy_var_prefs <- c('prior_', 'soil_tex_', 'ctrl_')
+```
+
+
+Number of observations by carbon pool.
+```{r n-obs}
+print(paste0(c_pool_labels[["agc"]], ": ", nrow(agc_df)))
+print(paste0(c_pool_labels[["bgc"]], ": ", nrow(bgc_df)))
+print(paste0(c_pool_labels[["soc"]], ": ", nrow(soc_df)))
+```
+
+
+## Descriptive figures
+
+
+Distribution of system age across all AGC, BGC and SOC observations.
+```{r age-density}
+comb_df <- agc_df %>% bind_rows(bgc_df) %>% bind_rows(soc_df)
+
+mean_age <- mean(comb_df$age)
+median_age <- median(comb_df$age)
+max_age <- max(comb_df$age)
+
+plot_obj <- comb_df %>%
+  ggplot(aes(x = age)) +
+  geom_density(fill = "deepskyblue", color = NA, alpha = 0.5) +
+  geom_vline(xintercept = mean_age, color = "deepskyblue4", linetype = "dashed", size = .75) +
+  geom_vline(xintercept = median_age, color = "darkred", linetype = "dashed", size = .75) +
+  geom_vline(xintercept = max_age, color = "black", linetype = "dashed", size = .75) +
+  xlim(0, max_age) +
+  labs(x = "System age at measurement",
+       y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(size = 10),
+        axis.text.y = element_blank(),  # removes y-axis numbers
+        axis.ticks.y = element_blank(), # optional: removes y-axis ticks
+        panel.grid.major.y = element_blank(), # remove major y grid lines
+        panel.grid.minor.y = element_blank(),  # remove minor y grid lines
+        panel.grid.minor.x = element_blank())
+
+
+# Get max y-axis value from histogram to position the label
+gg_data <- ggplot_build(plot_obj)$data[[1]]
+max_y <- max(gg_data$y)
+y_range <- max(gg_data$y) - min(gg_data$y)
+x_range <- max(gg_data$x) - min(gg_data$x)
+
+plot_obj <- plot_obj +
+  annotate("label", x = mean_age + x_range * .01, y = max_y - y_range * .4, label = paste0("Mean age = ", round(mean_age, 2)),
+           vjust = -0.5, hjust = 0, color = "deepskyblue4", fill = "white", size = 3) +
+  annotate("label", x = median_age + x_range * .01, y = max_y - y_range * .3, label = paste0("Median age = ", round(median_age, 2)),
+           vjust = -0.5, hjust = 0, color = "darkred", fill = "white", size = 3) +
+  annotate("label", x = max_age * .99, y = max_y - y_range * .5, label = paste0("Max age = ", round(max_age, 2)),
+           vjust = -0.5, hjust = 1, color = "black", fill = "white", size = 3)
+
+print(plot_obj)
+ggsave(here("output", "figures", "age_density.png"), width = 7, height = 4, dpi = 600)
+```
+
+
+Carbon density by age class (young/medium/mature) for stocks, plus annual change rates, as a 4 x 3 panel.
+```{r c-density-by-age, fig.width = 7, fig.height = 6}
+comb_plot_list_stock <- list()
+
+age_ranges <- c(0, 5, 15, 200)
+
+
+xmin_lkup <- c('agc' = 0, 'bgc' = 0, 'soc' = -50)
+
+xmax_lkup <- c('agc' = 130, 'bgc' = 30, 'soc' = 60)
+
+c_data_names_stock <- c_data_names[!grepl('change', c_data_names)]
+for (c_data_name in c_data_names_stock) {
+  plot_list <- list()
+  var_name <- 'c_t_ha'
+  age_var_name <- 'age'
+  age_txt_lab <- 'Age'
+
+  my_c_df <- get(paste0(c_data_name, '_df'))
+
+  for (i in 1:(length(age_ranges) - 1)) {
+
+    my_c_df_my_age <- my_c_df %>% filter(!!sym(age_var_name) > age_ranges[i],
+                                         !!sym(age_var_name) <= age_ranges[i+1])
+
+    mean <- mean(my_c_df_my_age[[var_name]])
+    median <- median(my_c_df_my_age[[var_name]])
+
+    plot_obj <- my_c_df_my_age %>%
+      ggplot(aes(x = !!sym(var_name))) +
+      geom_density(fill = "deepskyblue", color = NA, alpha = 0.5) +
+      geom_vline(xintercept = median, color = "deepskyblue4", linetype = "dashed", size = .75) +
+      xlim(xmin_lkup[c_data_name], xmax_lkup[c_data_name]) +
+      labs(x = dep_var_labels[var_name],
+           y = NULL) +
+      theme_minimal(base_size = 11) +
+      theme(plot.title = element_text(size = 10),
+            axis.text.y = element_blank(),  # removes y-axis numbers
+            axis.ticks.y = element_blank(), # optional: removes y-axis ticks
+            panel.grid.major.y = element_blank(), # remove major y grid lines
+            panel.grid.minor.y = element_blank(),  # remove minor y grid lines
+            panel.grid.minor.x = element_blank())
+
+
+    # Get axis values from histogram to position the label
+    gg_data <- ggplot_build(plot_obj)$data[[1]]
+    max_y <- max(gg_data$y)
+    y_range <- max(gg_data$y) - min(gg_data$y)
+    x_range <- max(gg_data$x) - min(gg_data$x)
+    built <- ggplot_build(plot_obj)
+    y_upper <- built$layout$panel_params[[1]]$y.range[2]
+
+    plot_obj <- plot_obj +
+      annotate("label", x = median + x_range * .05, y = y_upper * .55, label = paste0("Median = ", round(median, 2)),
+               vjust = -0.5, hjust = 0, color = "deepskyblue4", fill = "white", size = 3)
+
+
+    comb_plot_list_stock[[length(comb_plot_list_stock) + 1]] <- plot_obj
+  }
+
+}
+
+
+comb_plot_list_change <- list()
+
+c_data_names_change <- c_data_names[grepl('change', c_data_names)]
+for (c_data_name in c_data_names_change) {
+  var_name <- 'c_t_ha_yr'
+
+  my_c_df <- get(paste0(c_data_name, '_df'))
+  median <- median(my_c_df[[var_name]])
+
+
+  plot_obj <- get(paste0(c_data_name, '_df')) %>%
+    ggplot(aes(x = !!sym(var_name))) +
+    geom_density(fill = "deepskyblue", color = NA, alpha = 0.5) +
+    geom_vline(xintercept = median, color = "deepskyblue4", linetype = "dashed", size = .75) +
+    xlim(-11, 18) +
+    labs(
+         x = dep_var_labels[var_name],
+         y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(size = 10),
+          axis.text.y = element_blank(),  # removes y-axis numbers
+          axis.ticks.y = element_blank(), # optional: removes y-axis ticks
+          panel.grid.major.y = element_blank(), # remove major y grid lines
+          panel.grid.minor.y = element_blank(),  # remove minor y grid lines
+          panel.grid.minor.x = element_blank())
+
+
+  # Get axis values from histogram to position the label
+  gg_data <- ggplot_build(plot_obj)$data[[1]]
+  max_y <- max(gg_data$y)
+  y_range <- max(gg_data$y) - min(gg_data$y)
+  x_range <- max(gg_data$x) - min(gg_data$x)
+  built <- ggplot_build(plot_obj)
+  y_upper <- built$layout$panel_params[[1]]$y.range[2]
+
+  plot_obj <- plot_obj +
+    annotate("label", x = median + x_range * .05, y = y_upper * .55, label = paste0("Median = ", round(median, 2)),
+             vjust = -0.5, hjust = 0, color = "deepskyblue4", fill = "white", size = 3)
+
+
+  comb_plot_list_change[[length(comb_plot_list_change) + 1]] <- plot_obj
+
+}
+
+
+# Create text grobs for labels
+row1_label <- wrap_elements(grid::textGrob("Young\n(<5 yrs.)", rot = 90, gp = grid::gpar(fontsize = 12), just = "center"))
+row2_label <- wrap_elements(grid::textGrob("Medium\n(5-15 yrs.)", rot = 90, gp = grid::gpar(fontsize = 12), just = "center"))
+row3_label <- wrap_elements(grid::textGrob("Mature\n(>15 yrs.)", rot = 90, gp = grid::gpar(fontsize = 12), just = "center"))
+row4_label <- wrap_elements(grid::textGrob("Annual\nchange", rot = 90, gp = grid::gpar(fontsize = 12), just = "center"))
+colA_label <- wrap_elements(grid::textGrob("AGC", gp = grid::gpar(fontsize = 12), just = "center"))
+colB_label <- wrap_elements(grid::textGrob("BGC", gp = grid::gpar(fontsize = 12), just = "center"))
+colC_label <- wrap_elements(grid::textGrob(expression(Delta * "SOC"), gp = grid::gpar(fontsize = 12), just = "center"))
+
+
+# Build layout with spacers and labels
+comb_plot <- (
+  wrap_plots(
+    plot_spacer(), colA_label, colB_label, colC_label,
+    row1_label, comb_plot_list_stock[[1]], comb_plot_list_stock[[4]], comb_plot_list_stock[[7]],
+    row2_label, comb_plot_list_stock[[2]], comb_plot_list_stock[[5]], comb_plot_list_stock[[8]],
+    row3_label, comb_plot_list_stock[[3]], comb_plot_list_stock[[6]], comb_plot_list_stock[[9]],
+    row4_label, comb_plot_list_change[[1]], comb_plot_list_change[[2]], comb_plot_list_change[[3]],
+    ncol = 4, heights = c(0.15, 1, 1, 1, 1), widths = c(0.25, 1, 1, 1), axis_titles = 'collect'
+  )
+)
+
+suppressWarnings(print(comb_plot))
+ggsave(here("output", "figures", "c_density_by_age_panel.png"), width = 7, height = 6, dpi = 600)
+```
+
+
+## Bivariate analyses
+
+### Continuous predictors
+
+Scatter plots with OLS fits, and one simple linear regression per carbon pool x predictor.
+```{r cont-vars, fig.height=10, fig.width=7}
+cont_var_model_summary_table <- tibble()
+
+for (c_data_name in c_data_names) {
+  if(grepl('change', c_data_name)) {
+    dep_var_name <- 'c_t_ha_yr'
+  } else {
+    dep_var_name <- 'c_t_ha'
+  }
+
+  my_cont_vars <- cont_vars[cont_vars %in% colnames(get(paste0(c_data_name, '_df')))]
+
+  plot_list <- list()
+
+  for (cont_var in my_cont_vars) {
+
+    my_c_df <- get(paste0(c_data_name, '_df'))
+    n_total <- nrow(my_c_df)
+
+    plot_obj <- my_c_df %>%
+      ggplot(aes(x = !!sym(cont_var), y = !!sym(dep_var_name))) +
+      geom_point(size = .5) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.3))) +
+      geom_smooth(method = "lm", formula = y ~ x, se = TRUE, color = "blue", linewidth = .5) +
+      stat_poly_eq(
+        formula = y ~ x,
+        aes(label = paste(..eq.label.., ..rr.label.., ..p.value.label.., sep = "~~~")),
+        parse = TRUE,
+        size = 2.2,
+        label.x = 'right',
+        label.y = 'top'
+      ) +
+      theme_minimal(base_size = 10)
+
+    plot_list[[cont_var]] <- plot_obj
+
+
+    model <- lm(reformulate(cont_var, response = dep_var_name), data = my_c_df)
+
+    # tidy the output
+    tidy_model <- tidy(model)
+
+    # Flag models fit on < 10% of the pool's full sample (small, likely
+    # non-random subsample -- see predictor_summary_table footnote)
+    n_model <- nobs(model)
+    pct_n <- round(100 * n_model / n_total, 1)
+
+    table_dat <- tidy_model %>%
+      filter(term != "(Intercept)") %>%
+      mutate(
+        c_pool = c_pool_labels[[c_data_name]],
+        dependent_var = dep_var_name,
+        independent_var = term,
+        n = n_model,
+        low_n = pct_n < 10,
+        significance = case_when(
+          p.value < 0.001 ~ "***",
+          p.value < 0.01  ~ "**",
+          p.value < 0.05  ~ "*",
+          TRUE            ~ ""
+        )
+      ) %>%
+      bind_cols(tibble(r.squared = summary(model)$r.squared)) %>%
+      dplyr::select(c_pool, independent_var, dependent_var, estimate, std.error, statistic, r.squared, p.value, significance, n, low_n)
+
+    cont_var_model_summary_table <- cont_var_model_summary_table %>% bind_rows(table_dat)
+
+
+  }
+
+  combined_plot <- wrap_plots(plot_list, ncol = 3, axis_titles = 'collect') +
+    plot_annotation(title = c_data_name)
+
+  suppressWarnings(print(combined_plot))
+}
+```
+
+Carbon vs. system age scatter panel (AGC and SOC).
+```{r age-scatter}
+plot_list <- list()
+
+c_data_names_filt <- c('agc', 'soc')
+
+# find max age to standardize axes
+age_limits <- range(
+  unlist(
+    lapply(c_data_names_filt, function(nm) {
+      df <- get(paste0(nm, "_df"))
+      df$age
+    })
+  ),
+  na.rm = TRUE
+)
+age_max <- age_limits[2]
+
+
+for (c_data_name in c_data_names_filt) {
+  if(grepl('change', c_data_name)) {
+    dep_var_name <- 'c_t_ha_yr'
+  } else {
+    dep_var_name <- 'c_t_ha'
+  }
+
+  my_c_df <- get(paste0(c_data_name, '_df'))
+
+  plot_obj <- my_c_df %>%
+    ggplot(aes(x = age, y = !!sym(dep_var_name))) +
+    geom_point(size = .5, alpha = .5, fill = 'black', stroke = 0) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.3))) +
+    geom_smooth(method = "lm", formula = y ~ x, se = TRUE, fullrange = T, color = "deepskyblue4", linewidth = .5) +
+    stat_poly_eq(
+      formula = y ~ x,
+      aes(label = paste(..eq.label.., ..rr.label.., ..p.value.label.., sep = "~~~")),
+      parse = TRUE,
+      size = 2.2,
+      label.x = 'right',
+      label.y = 'top'
+    ) +
+    xlim(0, age_max) +
+    labs(x = "System age",
+         y = dep_var_labels['c_t_ha']) +
+    ggtitle(c_data_labels[c_data_name]) +
+    theme_minimal(base_size = 11)
+
+  plot_list[[c_data_name]] <- plot_obj
+
+
+}
+
+combined_plot <- wrap_plots(plot_list, ncol = 1, axis_titles = 'collect') 
+suppressWarnings(print(combined_plot))
+
+ggsave(here("output", "figures", "c_by_age_scatter_panel.png"), width = 7, height = 4, dpi = 600)
+```
+
+
+### Binary predictors
+
+Management practices and plant traits. Each level is compared to the grand mean with effect contrasts; only the `= 1` row is kept.
+```{r bin-vars, fig.height=10, fig.width=7}
+bin_var_model_summary_table <- tibble()
+
+for (c_data_name in c_data_names) {
+  if(grepl('change', c_data_name)) {
+    dep_var_name <- 'c_t_ha_yr'
+  } else {
+    dep_var_name <- 'c_t_ha'
+  }
+
+  plot_list <- list()
+
+  my_bin_vars <- bin_vars[bin_vars %in% colnames(get(paste0(c_data_name, '_df')))] # all bin vars
+
+
+  for (bin_var in my_bin_vars) {
+    my_c_df <- get(paste0(c_data_name, '_df'))
+    n_total <- nrow(my_c_df)
+    my_c_df[[bin_var]] <- factor(my_c_df[[bin_var]])
+
+    plot_obj <- my_c_df %>%
+      ggplot(aes(x = !!sym(bin_var), y = !!sym(dep_var_name))) +
+      geom_jitter(width = 0.2, alpha = 0.5, shape = 16, color = 'blue', size = .5) +
+      geom_boxplot(fill = "white", alpha = .5, color = "black", outliers = F) +
+      theme_minimal(base_size = 10)
+
+    plot_list[[bin_var]] <- plot_obj
+
+    # use effect coding (sum to zero contrasts) to compare each group to the grand mean
+
+    # Set contrasts globally or for the variable
+    contrasts(my_c_df[[bin_var]]) <- contr.sum(length(levels(my_c_df[[bin_var]])))
+
+    model <- lm(reformulate(bin_var, response = dep_var_name), data = my_c_df)
+
+    # Estimated marginal means (aka least square means)
+    em <- emmeans(model, specs = bin_var)
+
+    # Compare each category to the grand mean
+    grand_mean <- mean(my_c_df[[dep_var_name]])
+    tests <- contrast(em, method = "eff")  # effect coding comparisons
+
+    # Tidy output
+    tidy_tests <- tidy(tests)
+
+    # Flag models fit on < 10% of the pool's full sample (small, likely
+    # non-random subsample -- see predictor_summary_table footnote)
+    n_model <- nobs(model)
+    pct_n <- round(100 * n_model / n_total, 1)
+
+    table_dat <- tidy_tests %>%
+      mutate(
+        c_pool = c_pool_labels[[c_data_name]],
+        dependent_var = dep_var_name,
+        independent_var = bin_var,
+        category = str_replace(contrast, ' effect', ''),
+        p.value = adj.p.value,
+        n = n_model,
+        low_n = pct_n < 10,
+        significance = case_when(
+          p.value < 0.001 ~ "***",
+          p.value < 0.01  ~ "**",
+          p.value < 0.05  ~ "*",
+          TRUE            ~ ""
+        )
+      ) %>%
+      bind_cols(tibble(r.squared = summary(model)$r.squared)) %>%
+      dplyr::select(c_pool, independent_var, category, dependent_var, estimate, std.error, statistic, r.squared, p.value, significance, n, low_n)
+
+    table_dat <- table_dat %>%
+      filter(!grepl("0", category)) %>%
+      mutate(category = str_replace(category, "1", " = 1"))
+
+    bin_var_model_summary_table <- bin_var_model_summary_table %>% bind_rows(table_dat)
+  }
+
+  combined_plot <- wrap_plots(plot_list, ncol = 2, axis_titles = 'collect') +
+    plot_annotation(title = c_data_name)
+
+  suppressWarnings(print(combined_plot))
+
+}
+```
+
+
+### Categorical predictors (mutually exclusive factors)
+
+Each model reports a full-model F-test row plus effect contrasts of each category vs. the grand mean (emmeans-adjusted p-values).
+
+Agroforestry category.
+```{r af-cat, fig.height=4, fig.width=7}
+af_cat_model_summary_table <- tibble()
+
+plot_list <- list()
+
+for (c_data_name in c_data_names) {
+  if(grepl('change', c_data_name)) {
+    dep_var_name <- 'c_t_ha_yr'
+  } else {
+    dep_var_name <- 'c_t_ha'
+  }
+
+  my_c_df <- get(paste0(c_data_name, '_df'))
+  n_total <- nrow(my_c_df)
+
+  my_c_df <- my_c_df %>%
+    filter(af_cat %in% af_cats)
+
+  my_c_df <- my_c_df %>%
+    mutate(af_cat = af_cat_labels[af_cat]) %>%
+    mutate(af_cat = str_replace_all(af_cat, ' ' , '\n')) %>%
+    mutate(af_cat = factor(af_cat)) %>%
+    mutate(af_cat = fct_reorder(af_cat, !!sym(dep_var_name), .fun = function(x) mean(x, na.rm = TRUE), .desc = TRUE))
+
+
+  medians_df <- my_c_df %>%
+    group_by(af_cat) %>%
+    summarise(median_val = median(!!sym(dep_var_name), na.rm = TRUE))
+
+
+  plot_obj <- my_c_df %>%
+    ggplot(aes(x = reorder(af_cat, !!sym(dep_var_name), FUN = function(x) median(x, na.rm = TRUE), decreasing = T), 
+               y = !!sym(dep_var_name))) +
+    geom_jitter(width = 0.15, alpha = 0.4, shape = 16, color = 'deepskyblue4', size = .4, stroke = 0) +
+    geom_violin(trim = FALSE, fill = NA, color = "gray20") +
+    stat_summary(fun = function(x) median(x, na.rm = TRUE), 
+                 geom = "crossbar", width = .4, linewidth = .2, 
+                 color = "deeppink4") +
+    geom_label(
+      data = medians_df,
+      aes(
+        x = af_cat,
+        y = median_val,
+        label = sprintf("%.1f", median_val)
+      ),
+      nudge_x = 0.45,
+      fill = alpha("white", 0.8),   # semi‑transparent background
+      label.size = 0,               # **removes border**
+      label.padding = unit(0.02, "lines"),
+      color = "deeppink4",               # text color only
+      size = 2.25,
+      vjust = 0.5
+    ) +
+    coord_cartesian(clip = "off") +
+    scale_x_discrete(expand = expansion(mult = c(0.05, 0.1))) +
+    labs(title = c_data_labels[c_data_name], x = 'Agroforestry category', y = dep_var_labels[dep_var_name]) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(size = 8, angle = 45, hjust = 1),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank()
+    )
+
+  plot_list[[c_data_name]] <- plot_obj
+
+
+  # use effect coding (sum to zero contrasts) to compare each group to the grand mean
+
+  # Set contrasts globally or for the variable
+  contrasts(my_c_df$af_cat) <- contr.sum(length(levels(my_c_df$af_cat)))
+
+  model <- lm(reformulate('af_cat', response = dep_var_name), data = my_c_df)
+
+  # Estimated marginal means (aka least square means)
+  em <- emmeans(model, ~ af_cat)
+
+  # Compare each category to the grand mean
+  grand_mean <- mean(my_c_df[[dep_var_name]])
+  tests <- contrast(em, method = "eff")  # effect coding comparisons
+
+  # Tidy output
+  tidy_tests <- tidy(tests)
+
+  model_sum <- summary(model)
+  fs <- model_sum$fstatistic
+  model_p <- pf(fs[1], fs[2], fs[3], lower.tail = FALSE)
+
+  # Flag models fit on < 10% of the pool's full sample (small, likely
+  # non-random subsample -- see predictor_summary_table footnote)
+  n_model <- nobs(model)
+  pct_n <- round(100 * n_model / n_total, 1)
+
+  full_model_row <- tibble(
+    c_pool        = c_pool_labels[[c_data_name]],
+    independent_var = 'af_cat',
+    category      = 'Full model',
+    dependent_var = dep_var_name,
+    estimate      = NA_real_,
+    std.error     = NA_real_,
+    statistic     = NA_real_,
+    r.squared     = model_sum$r.squared,
+    p.value       = model_p,
+    n             = n_model,
+    low_n         = pct_n < 10,
+    significance  = case_when(
+      model_p < 0.001 ~ "***",
+      model_p < 0.01  ~ "**",
+      model_p < 0.05  ~ "*",
+      TRUE            ~ ""
+    )
+  )
+
+  category_rows <- tidy_tests %>%
+    mutate(
+      c_pool = c_pool_labels[[c_data_name]],
+      dependent_var = dep_var_name,
+      independent_var = 'af_cat',
+      category = str_replace(contrast, ' effect', ''),
+      p.value = adj.p.value,
+      r.squared = NA_real_,
+      n = n_model,
+      low_n = pct_n < 10,
+      significance = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE            ~ ""
+      )
+    ) %>%
+    dplyr::select(c_pool, independent_var, category, dependent_var, estimate, std.error, statistic, r.squared, p.value, significance, n, low_n)
+
+  table_dat <- bind_rows(full_model_row, category_rows)
+
+  af_cat_model_summary_table <- af_cat_model_summary_table %>% bind_rows(table_dat)
+
+}
+
+combined_plot <- wrap_plots(plot_list[c(1,3)], ncol = 1, axes = 'collect', axis_titles = 'collect')
+suppressWarnings(print(combined_plot))
+
+ggsave(here("output", "figures", "c_by_cat_violin_panel.png"), width = 7, height = 4, dpi = 600)
+```
+
+
+Ecoregion (Audebert region, recoded to lower cardinality; categories with < 20 observations are dropped).
+```{r ecoregion, fig.height=4, fig.width=7}
+audebert_reg_model_summary_table <- tibble()
+
+plot_list <- list()
+
+for (c_data_name in c_data_names) {
+  if(grepl('change', c_data_name)) {
+    dep_var_name <- 'c_t_ha_yr'
+  } else {
+    dep_var_name <- 'c_t_ha'
+  }
+
+  my_c_df <- get(paste0(c_data_name, '_df'))
+  n_total <- nrow(my_c_df)
+
+  my_c_df <- my_c_df %>%
+    filter(!is.na(ecoregion)) %>%
+    add_count(ecoregion, name = "n") %>%  # add per-category counts as a column
+    filter(n >= 20) %>%                 # keep categories with at least 20 rows
+    dplyr::select(-n)              
+
+  my_c_df <- my_c_df %>%
+    mutate(ecoregion = factor(ecoregion)) %>%
+    mutate(ecoregion = fct_reorder(ecoregion, !!sym(dep_var_name), .fun = stats::median, .desc = TRUE))
+
+  medians_df <- my_c_df %>%
+    group_by(ecoregion) %>%
+    summarise(median_val = median(!!sym(dep_var_name), na.rm = TRUE))
+
+  plot_obj <- my_c_df %>%
+    ggplot(aes(x = reorder(ecoregion, !!sym(dep_var_name), FUN = function(x) median(x, na.rm = TRUE), decreasing = T), 
+               y = !!sym(dep_var_name))) +
+    geom_jitter(width = 0.15, alpha = 0.4, shape = 16, color = 'deepskyblue4', size = .4, stroke = 0) +
+    geom_violin(trim = FALSE, fill = NA, color = "gray20") +
+    stat_summary(fun = function(x) median(x, na.rm = TRUE), 
+                 geom = "crossbar", width = .4, linewidth = .2, 
+                 color = "deeppink4") +
+    geom_label(
+      data = medians_df,
+      aes(
+        x = ecoregion,
+        y = median_val,
+        label = sprintf("%.1f", median_val)
+      ),
+      nudge_x = 0.3,
+      fill = alpha("white", 0.8),   # semi‑transparent background
+      label.size = 0,               # **removes border**
+      label.padding = unit(0.05, "lines"),
+      color = "deeppink4",               # text color only
+      size = 3,
+      vjust = 0.5
+    ) +
+    coord_cartesian(clip = "off") +
+    scale_x_discrete(expand = expansion(mult = c(0.05, 0.1))) +
+    labs(title = c_data_labels[c_data_name], x = 'Ecoregion', y = dep_var_labels[dep_var_name]) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(), # for wider plot
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank()
+    )
+
+  plot_list[[c_data_name]] <- plot_obj
+
+
+  # use effect coding (sum to zero contrasts) to compare each group to the grand mean
+
+  # Set contrasts globally or for the variable
+  contrasts(my_c_df$ecoregion) <- contr.sum(length(levels(my_c_df$ecoregion)))
+
+  model <- lm(reformulate('ecoregion', response = dep_var_name), data = my_c_df)
+
+  # Estimated marginal means (aka least square means)
+  em <- emmeans(model, ~ ecoregion)
+
+  # Compare each category to the grand mean
+  grand_mean <- mean(my_c_df[[dep_var_name]])
+  tests <- contrast(em, method = "eff")  # effect coding comparisons
+
+  # Tidy output
+  tidy_tests <- tidy(tests)
+
+  model_sum <- summary(model)
+  fs <- model_sum$fstatistic
+  model_p <- pf(fs[1], fs[2], fs[3], lower.tail = FALSE)
+
+  # Flag models fit on < 10% of the pool's full sample (small, likely
+  # non-random subsample -- see predictor_summary_table footnote)
+  n_model <- nobs(model)
+  pct_n <- round(100 * n_model / n_total, 1)
+
+  full_model_row <- tibble(
+    c_pool        = c_pool_labels[[c_data_name]],
+    independent_var = 'ecoregion',
+    category      = 'Full model',
+    dependent_var = dep_var_name,
+    estimate      = NA_real_,
+    std.error     = NA_real_,
+    statistic     = NA_real_,
+    r.squared     = model_sum$r.squared,
+    p.value       = model_p,
+    n             = n_model,
+    low_n         = pct_n < 10,
+    significance  = case_when(
+      model_p < 0.001 ~ "***",
+      model_p < 0.01  ~ "**",
+      model_p < 0.05  ~ "*",
+      TRUE            ~ ""
+    )
+  )
+
+  category_rows <- tidy_tests %>%
+    mutate(
+      c_pool = c_pool_labels[[c_data_name]],
+      dependent_var = dep_var_name,
+      independent_var = 'ecoregion',
+      category = str_replace(contrast, ' effect', ''),
+      p.value = adj.p.value,
+      r.squared = NA_real_,
+      n = n_model,
+      low_n = pct_n < 10,
+      significance = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE            ~ ""
+      )
+    ) %>%
+    dplyr::select(c_pool, independent_var, category, dependent_var, estimate, std.error, statistic, r.squared, p.value, significance, n, low_n)
+
+  table_dat <- bind_rows(full_model_row, category_rows)
+
+  audebert_reg_model_summary_table <- audebert_reg_model_summary_table %>% bind_rows(table_dat)
+
+}
+
+
+combined_plot <- wrap_plots(plot_list[c(1,3)], ncol = 1, axes = 'collect', axis_titles = 'collect')
+suppressWarnings(print(combined_plot))
+
+ggsave(here("output", "figures", "c_by_ecoreg_violin_panel.png"), width = 7, height = 4, dpi = 600)
+```
+
+
+### Categorical predictors derived from dummy variables
+
+Drop the original categorical columns (`ctrl_cat`, `prior_land_use`, `soil_texture_class`) the dummies were built from, so they are not caught by the `prior_`/`ctrl_`/`soil_tex_` prefix matching below.
+```{r drop-cat-cols}
+for (c_data_name in c_data_names) {
+  my_c_df <- get(paste0(c_data_name, '_df'))
+
+  if (c_data_name == 'soc' || c_data_name == 'soc_change') {
+    my_c_df <- my_c_df %>%
+      select(-c(ctrl_cat, prior_land_use, soil_texture_class))
+  } else {
+    my_c_df <- my_c_df %>%
+      select(-c(prior_land_use, soil_texture_class))
+  }
+  assign(paste0(c_data_name, '_df'), my_c_df)
+}
+```
+
+
+Prior land use (category reconstructed from the `prior_*` dummies, taking the largest value per row).
+```{r prior-cat}
+prior_cat_model_summary_table <- tibble()
+
+for (c_data_name in c_data_names) {
+  if(grepl('change', c_data_name)) {
+    dep_var_name <- 'c_t_ha_yr'
+  } else {
+    dep_var_name <- 'c_t_ha'
+  }
+
+  my_c_df <- get(paste0(c_data_name, '_df'))
+  n_total <- nrow(my_c_df)
+  prior_cols <- grep("^prior_", names(my_c_df), value = TRUE)
+
+  my_c_df <- my_c_df %>%
+    mutate(across(all_of(prior_cols), ~ifelse(is.na(.), 0, .))) %>%
+    rowwise() %>%
+    mutate(prior_cat = {
+      row_vals <- c_across(all_of(prior_cols))
+      max_idx <- which.max(row_vals)
+      if (length(max_idx) == 0 || all(row_vals == 0)) NA_character_ else prior_cols[max_idx]
+    }) %>%
+    ungroup() %>%
+    drop_na(prior_cat) %>%
+    mutate(prior_cat = str_replace(prior_cat, 'prior_', ''))
+
+
+  my_c_df <- my_c_df %>%
+    mutate(prior_cat = fct_reorder(prior_cat, !!sym(dep_var_name), .fun = stats::median, .desc = TRUE))
+
+  plot_obj <- my_c_df %>%
+    ggplot(aes(x = prior_cat, y = !!sym(dep_var_name))) +
+    geom_jitter(width = 0.2, alpha = 0.5, shape = 16, color = 'blue', size = .5) +
+    geom_boxplot(fill = "white", alpha = .5, color = "black", outliers = F) +
+    labs(title = c_data_name) +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  suppressWarnings(print(plot_obj))
+
+
+  # use effect coding (sum to zero contrasts) to compare each group to the grand mean
+
+  # Set contrasts globally or for the variable
+  contrasts(my_c_df$prior_cat) <- contr.sum(length(levels(my_c_df$prior_cat)))
+
+  model <- lm(reformulate('prior_cat', response = dep_var_name), data = my_c_df)
+
+  # Estimated marginal means (aka least square means)
+  em <- emmeans(model, ~ prior_cat)
+
+  # Compare each category to the grand mean
+  grand_mean <- mean(my_c_df[[dep_var_name]])
+  tests <- contrast(em, method = "eff")  # effect coding comparisons
+
+  # Tidy output
+  tidy_tests <- tidy(tests)
+
+  model_sum <- summary(model)
+  fs <- model_sum$fstatistic
+  model_p <- pf(fs[1], fs[2], fs[3], lower.tail = FALSE)
+
+  # Flag models fit on < 10% of the pool's full sample (small, likely
+  # non-random subsample -- see predictor_summary_table footnote)
+  n_model <- nobs(model)
+  pct_n <- round(100 * n_model / n_total, 1)
+
+  full_model_row <- tibble(
+    c_pool        = c_pool_labels[[c_data_name]],
+    independent_var = 'prior_cat',
+    category      = 'Full model',
+    dependent_var = dep_var_name,
+    estimate      = NA_real_,
+    std.error     = NA_real_,
+    statistic     = NA_real_,
+    r.squared     = model_sum$r.squared,
+    p.value       = model_p,
+    n             = n_model,
+    low_n         = pct_n < 10,
+    significance  = case_when(
+      model_p < 0.001 ~ "***",
+      model_p < 0.01  ~ "**",
+      model_p < 0.05  ~ "*",
+      TRUE            ~ ""
+    )
+  )
+
+  category_rows <- tidy_tests %>%
+    mutate(
+      c_pool = c_pool_labels[[c_data_name]],
+      dependent_var = dep_var_name,
+      independent_var = 'prior_cat',
+      category = str_replace(contrast, ' effect', ''),
+      p.value = adj.p.value,
+      r.squared = NA_real_,
+      n = n_model,
+      low_n = pct_n < 10,
+      significance = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE            ~ ""
+      )
+    ) %>%
+    dplyr::select(c_pool, independent_var, category, dependent_var, estimate, std.error, statistic, r.squared, p.value, significance, n, low_n)
+
+  table_dat <- bind_rows(full_model_row, category_rows)
+
+  prior_cat_model_summary_table <- prior_cat_model_summary_table %>% bind_rows(table_dat)
+
+
+}
+```
+
+
+Control land-use category (SOC pools only).
+```{r ctrl-cat}
+ctrl_cat_model_summary_table <- tibble()
+
+for (c_data_name in c('soc', 'soc_change')) {
+  if (grepl('change', c_data_name)) {
+    dep_var_name <- 'c_t_ha_yr'
+  } else {
+    dep_var_name <- 'c_t_ha'
+  }
+
+  my_c_df <- get(paste0(c_data_name, '_df'))
+  n_total <- nrow(my_c_df)
+  ctrl_cols <- grep("^ctrl_", names(my_c_df), value = TRUE)
+
+  my_c_df <- my_c_df %>%
+    mutate(across(all_of(ctrl_cols), ~ifelse(is.na(.), 0, .))) %>%
+    rowwise() %>%
+    mutate(ctrl_cat = {
+      row_vals <- c_across(all_of(ctrl_cols))
+      max_idx <- which.max(row_vals)
+      if (length(max_idx) == 0 || all(row_vals == 0)) NA_character_ else ctrl_cols[max_idx]
+    }) %>%
+    ungroup() %>%
+    drop_na(ctrl_cat) %>%
+    mutate(ctrl_cat = str_replace(ctrl_cat, 'ctrl_', ''))
+
+  my_c_df <- my_c_df %>%
+    mutate(ctrl_cat = fct_reorder(ctrl_cat, !!sym(dep_var_name), .fun = stats::median, .desc = TRUE))
+
+  plot_obj <- my_c_df %>%
+    ggplot(aes(x = ctrl_cat, y = !!sym(dep_var_name))) +
+    geom_jitter(width = 0.2, alpha = 0.5, shape = 16, color = 'blue', size = .5) +
+    geom_boxplot(fill = "white", alpha = .5, color = "black", outliers = F) +
+    labs(title = c_data_name) +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  suppressWarnings(print(plot_obj))
+
+  # use effect coding (sum to zero contrasts) to compare each group to the grand mean
+  contrasts(my_c_df$ctrl_cat) <- contr.sum(length(levels(my_c_df$ctrl_cat)))
+
+  model <- lm(reformulate('ctrl_cat', response = dep_var_name), data = my_c_df)
+
+  # Estimated marginal means (aka least square means)
+  em <- emmeans(model, ~ ctrl_cat)
+
+  # Compare each category to the grand mean
+  grand_mean <- mean(my_c_df[[dep_var_name]])
+  tests <- contrast(em, method = "eff")  # effect coding comparisons
+
+  # Tidy output
+  tidy_tests <- tidy(tests)
+
+  model_sum <- summary(model)
+  fs <- model_sum$fstatistic
+  model_p <- pf(fs[1], fs[2], fs[3], lower.tail = FALSE)
+
+  # Flag models fit on < 10% of the pool's full sample (small, likely
+  # non-random subsample -- see predictor_summary_table footnote)
+  n_model <- nobs(model)
+  pct_n <- round(100 * n_model / n_total, 1)
+
+  full_model_row <- tibble(
+    c_pool        = c_pool_labels[[c_data_name]],
+    independent_var = 'ctrl_cat',
+    category      = 'Full model',
+    dependent_var = dep_var_name,
+    estimate      = NA_real_,
+    std.error     = NA_real_,
+    statistic     = NA_real_,
+    r.squared     = model_sum$r.squared,
+    p.value       = model_p,
+    n             = n_model,
+    low_n         = pct_n < 10,
+    significance  = case_when(
+      model_p < 0.001 ~ "***",
+      model_p < 0.01  ~ "**",
+      model_p < 0.05  ~ "*",
+      TRUE            ~ ""
+    )
+  )
+
+  category_rows <- tidy_tests %>%
+    mutate(
+      c_pool = c_pool_labels[[c_data_name]],
+      dependent_var = dep_var_name,
+      independent_var = 'ctrl_cat',
+      category = str_replace(contrast, ' effect', ''),
+      p.value = adj.p.value,
+      r.squared = NA_real_,
+      n = n_model,
+      low_n = pct_n < 10,
+      significance = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE            ~ ""
+      )
+    ) %>%
+    dplyr::select(c_pool, independent_var, category, dependent_var, estimate, std.error, statistic, r.squared, p.value, significance, n, low_n)
+
+  table_dat <- bind_rows(full_model_row, category_rows)
+
+  ctrl_cat_model_summary_table <- ctrl_cat_model_summary_table %>% bind_rows(table_dat)
+
+}
+```
+
+
+Soil texture class (reconstructed from the `soil_tex_*` dummies).
+```{r soil-tex}
+soil_tex_cat_model_summary_table <- tibble()
+
+for (c_data_name in c_data_names) {
+  if(grepl('change', c_data_name)) {
+    dep_var_name <- 'c_t_ha_yr'
+  } else {
+    dep_var_name <- 'c_t_ha'
+  }
+
+  my_c_df <- get(paste0(c_data_name, '_df'))
+  n_total <- nrow(my_c_df)
+  soil_tex_cols <- grep("^soil_tex_", names(my_c_df), value = TRUE)
+
+  my_c_df <- my_c_df %>%
+    mutate(across(all_of(soil_tex_cols), ~ifelse(is.na(.), 0, .))) %>%
+    rowwise() %>%
+    mutate(soil_tex_cat = {
+      row_vals <- c_across(all_of(soil_tex_cols))
+      max_idx <- which.max(row_vals)
+      if (length(max_idx) == 0 || all(row_vals == 0)) NA_character_ else soil_tex_cols[max_idx]
+    }) %>%
+    ungroup() %>%
+    drop_na(soil_tex_cat) %>%
+    mutate(soil_tex_cat = str_replace(soil_tex_cat, 'soil_tex_', ''))
+
+  my_c_df <- my_c_df %>%
+    mutate(soil_tex_cat = fct_reorder(soil_tex_cat, !!sym(dep_var_name), .fun = stats::median, .desc = TRUE))
+
+  plot_obj <- my_c_df %>%
+    ggplot(aes(x = soil_tex_cat, y = !!sym(dep_var_name))) +
+    geom_jitter(width = 0.2, alpha = 0.5, shape = 16, color = 'blue', size = .5) +
+    geom_boxplot(fill = "white", alpha = .5, color = "black", outliers = F) +
+    labs(title = c_data_name) +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  suppressWarnings(print(plot_obj))
+
+
+  # use effect coding (sum to zero contrasts) to compare each group to the grand mean
+
+  # Set contrasts globally or for the variable
+  contrasts(my_c_df$soil_tex_cat) <- contr.sum(length(levels(my_c_df$soil_tex_cat)))
+
+  model <- lm(reformulate('soil_tex_cat', response = dep_var_name), data = my_c_df)
+
+  # Estimated marginal means (aka least square means)
+  em <- emmeans(model, ~ soil_tex_cat)
+
+  # Compare each category to the grand mean
+  grand_mean <- mean(my_c_df[[dep_var_name]])
+  tests <- contrast(em, method = "eff")  # effect coding comparisons
+
+  # Tidy output
+  tidy_tests <- tidy(tests)
+
+  model_sum <- summary(model)
+  fs <- model_sum$fstatistic
+  model_p <- pf(fs[1], fs[2], fs[3], lower.tail = FALSE)
+
+  # Flag models fit on < 10% of the pool's full sample (small, likely
+  # non-random subsample -- see predictor_summary_table footnote)
+  n_model <- nobs(model)
+  pct_n <- round(100 * n_model / n_total, 1)
+
+  full_model_row <- tibble(
+    c_pool        = c_pool_labels[[c_data_name]],
+    independent_var = 'soil_tex_cat',
+    category      = 'Full model',
+    dependent_var = dep_var_name,
+    estimate      = NA_real_,
+    std.error     = NA_real_,
+    statistic     = NA_real_,
+    r.squared     = model_sum$r.squared,
+    p.value       = model_p,
+    n             = n_model,
+    low_n         = pct_n < 10,
+    significance  = case_when(
+      model_p < 0.001 ~ "***",
+      model_p < 0.01  ~ "**",
+      model_p < 0.05  ~ "*",
+      TRUE            ~ ""
+    )
+  )
+
+  category_rows <- tidy_tests %>%
+    mutate(
+      c_pool = c_pool_labels[[c_data_name]],
+      dependent_var = dep_var_name,
+      independent_var = 'soil_tex_cat',
+      category = str_replace(contrast, ' effect', ''),
+      p.value = adj.p.value,
+      r.squared = NA_real_,
+      n = n_model,
+      low_n = pct_n < 10,
+      significance = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE            ~ ""
+      )
+    ) %>%
+    dplyr::select(c_pool, independent_var, category, dependent_var, estimate, std.error, statistic, r.squared, p.value, significance, n, low_n)
+
+  table_dat <- bind_rows(full_model_row, category_rows)
+
+  soil_tex_cat_model_summary_table <- soil_tex_cat_model_summary_table %>% bind_rows(table_dat)
+
+
+}
+```
+
+## Write model summary tables
+
+Combine all bivariate model summaries into one workbook (one sheet per predictor type) and a long CSV used by notebooks 06 and 10.
+```{r write-summaries}
+model_summary_df_names <- c('cont_var_model_summary_table',
+                            'bin_var_model_summary_table',
+                            'af_cat_model_summary_table',
+                            'audebert_reg_model_summary_table',
+                            'prior_cat_model_summary_table',
+                            'ctrl_cat_model_summary_table',
+                            'soil_tex_cat_model_summary_table')
+
+# Format numbers: round to 2 dp, replace non-zero values that round to 0.00 with "<0.01"
+fmt_num <- function(x) {
+  ifelse(is.na(x), NA_character_,
+    ifelse(round(x, 2) == 0 & x != 0, "<0.01",
+           sprintf("%.2f", x)))
+}
+
+# Caveat footnote for models fit on < 10% of the pool's full sample
+low_n_footnote <- "\u2020 n represents less than 10% of the full sample for that carbon pool; the estimate is based on a small, likely non-random subsample of studies (predictors like management practices are only reported by a handful of studies) and should be interpreted with caution."
+
+format_summary_table <- function(df) {
+  df %>%
+    # Ensure category follows independent_var
+    relocate(any_of("category"), .after = independent_var) %>%
+    # Strip emmeans-added parentheses around category names (caused by slashes in names)
+    mutate(across(any_of("category"), ~str_replace(., "^\\((.*)\\)$", "\\1"))) %>%
+    # Round all numeric columns (n/low_n handled separately below)
+    mutate(across(where(is.numeric) & !any_of(c("n")), fmt_num)) %>%
+    # Demarcate low-n rows (< 10% of pool's full sample) with a dagger
+    # Use a dagger (not "*") so low-n rows aren't confused with the sig. column
+    mutate(n = if_else(low_n, paste0(n, "\u2020"), as.character(n))) %>%
+    dplyr::select(-low_n)
+}
+
+# Create a new workbook
+wb <- createWorkbook()
+
+for (name in model_summary_df_names) {
+  short_name <- str_replace(name, '_model_summary_table', '')
+  addWorksheet(wb, short_name)
+  writeData(wb, short_name, get(name) |> format_summary_table())
+}
+
+# Footnote sheet with the low-n caveat
+addWorksheet(wb, "Notes")
+writeData(wb, "Notes", low_n_footnote)
+
+# Save workbook
+saveWorkbook(wb, here("output", "tables", "bivariate_model_summaries.xlsx"), overwrite = TRUE)
+
+# Save combined long CSV
+mget(model_summary_df_names) %>%
+  bind_rows() %>%
+  format_summary_table() %>%
+  write_csv(here("output", "tables", "bivariate_model_summaries_long.csv"))
+```

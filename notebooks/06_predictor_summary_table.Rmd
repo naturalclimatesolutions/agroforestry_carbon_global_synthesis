@@ -1,0 +1,244 @@
+---
+title: "06 - Predictor summary table"
+output: html_document
+---
+
+**Purpose.** Build the predictor summary table for the paper. For each candidate predictor, it reports the data source, variable type, data completeness (% of plots with non-missing values) in the AGC and SOC datasets, and the bivariate model fit statistics (n, R², p, significance) from notebook 06.
+
+**Inputs.**
+
+- `output/data/agc_by_plot_and_age_w_covars_drop_outliers.xlsx` (notebook 04)
+- `output/data/soc_by_plot_and_age_w_covars_drop_outliers.xlsx` (notebook 04)
+- `output/tables/bivariate_model_summaries_long.csv` (notebook 05)
+
+**Outputs.**
+
+- `output/tables/predictor_summary_table.csv`
+- `output/tables/predictor_summary_table.xlsx`
+
+```{r setup}
+library(here)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(openxlsx)
+```
+
+
+Lookup table of candidate predictors with display labels, data sources (primary and backup), and variable type.
+```{r predictor-lookup}
+predictor_lkup <- tribble(
+  ~Variable,                ~Label,                          ~source_prim,    ~source_bkup,  ~type,
+  "af_cat",                 "Agroforestry category", "Literature", NA, "Categorical",
+  "age",                    "Age (years)", "Literature", NA, "Continuous",
+  "prior_land_use",             "Prior land use", "Literature", NA, "Categorical",
+  "ctrl_cat",               "Control land use (SOC only)", "Literature", NA,  "Categorical",
+  "ecoregion",    "Ecoregion", "Audebert (2024)", NA, "Categorical",
+  "masl",                   "Elevation (m)", "Literature", "Worldclim", "Continuous",
+  "map",                    "Mean annual precipitation (mm)", "Literature", "Worldclim", "Continuous",
+  "mat",                    "Mean annual temperature (°C)", "Literature", "Worldclim", "Continuous",
+  "trees_per_ha",           "Trees per hectare", "Literature", NA, "Continuous",
+  "af_diversity",              "Tree species diversity", "Literature", NA,  "Continuous",
+  "sand_pct",               "Sand (%)", "Literature", "Soilgrids", "Continuous",
+  "silt_pct",               "Silt (%)", "Literature", "Soilgrids", "Continuous",
+  "clay_pct",               "Clay (%)", "Literature", "Soilgrids", "Continuous",
+  "pruning",                "Management: Pruning", "Literature", NA, "Binary",
+  "weed_control",           "Management: Weed control", "Literature", NA, "Binary",
+  "tillage",                "Management: Tillage", "Literature", NA, "Binary",
+  "grazing",                "Management: Grazers", "Literature", NA, "Binary",
+  "burning",                "Management: Burning", "Literature", NA, "Binary",
+  "litter_management",                 "Management: Litter", "Literature", NA, "Binary",
+  "pest_control",           "Management: Pest control", "Literature", NA, "Binary",
+  "fertilizer",             "Management: Fertilizer", "Literature", NA, "Binary",
+  "irrigation",             "Management: Irrigation", "Literature", NA, "Binary",
+  "avg_veg_height_m",       "Avg. vegetation height (m)", "TryDB", NA, "Continuous",
+  "avg_leaf_area_mm2_mg",   "Specific leaf area (mm²/mg)", "TryDB", NA, "Continuous",
+  "n_fix_bin",              "Nitrogen fixer", "TryDB", NA,  "Binary",
+  "myco_fungi_am",          "Mycorrhizal fungi: AM", "TryDB", NA,  "Binary",
+  "myco_fungi_ecm",         "Mycorrhizal fungi: ECM", "TryDB", NA,  "Binary",
+  "freezing_exposed",       "Tolerance to freezing", "TryDB", NA,  "Binary"
+)
+```
+
+
+Load the final AGC and SOC analysis datasets (used to calculate predictor completeness) and keep only the predictor columns.
+```{r load-data}
+agc_df <- read.xlsx(here("output", "data", "agc_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+soc_df <- read.xlsx(here("output", "data", "soc_by_plot_and_age_w_covars_drop_outliers.xlsx")) %>%
+  mutate(c_t_ha_comp = ifelse(!is.na(c_t_ha_ctrl), c_t_ha_ctrl, c_t_ha_prev_chron)) %>% # coalesce ctrl and prev_chron c_t_ha cols
+  mutate(comp_type = ifelse(!is.na(c_t_ha_ctrl), "ctrl", ifelse(!is.na(c_t_ha_prev_chron), "prev_chron", NA))) %>% # record comp type as ctrl vs. prev_chron
+  select(-c(c_t_ha_ctrl, c_t_ha_prev_chron)) %>%
+  relocate(comp_type, .before = ctrl_cat) %>%
+  relocate(c_t_ha_comp, .after = ctrl_cat)
+
+# filter to just vars of interest
+agc_df <- agc_df %>%
+  select(any_of(predictor_lkup$Variable))
+
+soc_df <- soc_df %>%
+  select(any_of(predictor_lkup$Variable))
+```
+
+
+Load the bivariate model summaries produced by notebook 06.
+```{r load-bivar}
+bivar_sums <- read_csv(here("output", "tables", "bivariate_model_summaries_long.csv"))
+```
+
+Build the predictor summary table: per-predictor data completeness and bivariate model fit statistics for AGC and SOC.
+```{r build-table}
+# 1. Completeness (% non-missing) for each predictor variable
+#    Treat blank strings as missing across all character columns
+agc_completeness <- agc_df |>
+  mutate(across(where(is.character), ~ na_if(trimws(.), ""))) |>
+  summarise(across(everything(), ~ round(mean(!is.na(.)) * 100))) |>
+  pivot_longer(everything(), names_to = "Variable", values_to = "agc_completeness")
+
+soc_completeness <- soc_df |>
+  mutate(across(where(is.character), ~ na_if(trimws(.), ""))) |>
+  summarise(across(everything(), ~ round(mean(!is.na(.)) * 100))) |>
+  pivot_longer(everything(), names_to = "Variable", values_to = "soc_completeness")
+
+# 2. One summary row per (c_pool, independent_var):
+#    Continuous: category is NA; Categorical: 'Full model' row; Binary: single 'var = 1' row
+
+# c_pool labels in bivariate_model_summaries_long.csv reflect whichever
+# use_soc_delta setting was active when it was built (notebook 05
+# labels the SOC pool "\u0394SOC" when the delta version was used, "SOC" otherwise)
+agc_pool_label <- "AGC"
+soc_pool_label <- unique(bivar_sums$c_pool)[grepl("SOC$", unique(bivar_sums$c_pool))]
+
+# n (with a trailing "†" when the model was fit on < 10% of the pool's full
+# sample) is carried through as-is from bivariate_model_summaries_long.csv,
+# which already applies the low-n demarcation computed in notebook 05
+bivar_key <- bivar_sums |>
+  filter(c_pool %in% c(agc_pool_label, soc_pool_label)) |>
+  filter(is.na(category) | category == "Full model" | grepl(" = 1$", category)) |>
+  mutate(c_pool = recode(c_pool, !!!setNames(c("agc", "soc"), c(agc_pool_label, soc_pool_label)))) |>
+  select(c_pool, independent_var, R2 = r.squared, p = p.value, sig = significance, n)
+
+bivar_wide <- bivar_key |>
+  pivot_wider(
+    names_from  = c_pool,
+    values_from = c(R2, p, sig, n),
+    names_glue  = "{c_pool}_{.value}"
+  )
+
+# 3. Join to predictor_lkup
+#    Use Variable for completeness joins, join_var (prior_land_use→prior_cat) only for bivar
+pred_table <- predictor_lkup |>
+  mutate(join_var = if_else(Variable == "prior_land_use", "prior_cat", Variable)) |>
+  left_join(agc_completeness, by = "Variable") |>
+  left_join(soc_completeness, by = "Variable") |>
+  left_join(bivar_wide,       by = c("join_var" = "independent_var")) |>
+  mutate(Source = if_else(!is.na(source_bkup),
+                          paste(source_prim, source_bkup, sep = ", "),
+                          source_prim)) |>
+  select(
+    Predictor        = Label,
+    Source,
+    Type             = type,
+    agc_Completeness = agc_completeness,
+    agc_n, agc_R2, agc_p, agc_sig,
+    soc_Completeness = soc_completeness,
+    soc_n, soc_R2, soc_p, soc_sig
+  )
+
+pred_table
+```
+
+
+Save the predictor summary table as a CSV (two-row header) and a journal-style formatted Excel workbook.
+```{r save-table}
+out_dir <- here("output", "tables")
+
+# Caveat footnote for predictors whose bivariate model was fit on < 10% of
+# the pool's full sample (n values carry a trailing "†" from
+# bivariate_model_summaries_long.csv to flag this)
+low_n_footnote <- "\u2020 n represents less than 10% of the full sample for that carbon pool; the estimate is based on a small, likely non-random subsample of studies (predictors like management practices are only reported by a handful of studies) and should be interpreted with caution."
+
+# Final formatting: completeness as "X%", blank NA significance
+pred_table_out <- pred_table |>
+  mutate(
+    across(c(agc_sig, soc_sig), ~ if_else(is.na(.) | . == "NA", "", .)),
+    across(ends_with("Completeness"), ~ if_else(is.na(.), NA_character_, paste0(., "%")))
+  )
+
+# --- CSV: two-row header matching template ---
+header1 <- c("", "", "", agc_pool_label, "", "", "", "", soc_pool_label, "", "", "", "")
+header2 <- c("Predictor", "Source", "Type",
+             "Coverage", "n", "R2", "p", "sig.",
+             "Coverage", "n", "R2", "p", "sig.")
+
+csv_path <- file.path(out_dir, "predictor_summary_table.csv")
+writeLines(paste(header1, collapse = ","), csv_path)
+write_csv(pred_table_out, csv_path, append = TRUE, col_names = FALSE)
+lines <- readLines(csv_path)
+writeLines(c(lines[1], paste(header2, collapse = ","), lines[-1], paste0("\"", low_n_footnote, "\"")), csv_path)
+
+# --- Excel: academic journal style (B&W, horizontal rules only) ---
+wb2 <- createWorkbook()
+addWorksheet(wb2, "Predictor summary")
+
+n_data_rows   <- nrow(pred_table_out)
+last_data_row <- 2 + n_data_rows
+
+# Data starts at row 3; headers written manually in row 2
+writeData(wb2, 1, pred_table_out, startRow = 3, startCol = 1, colNames = FALSE)
+
+# Row 1: AGC (cols 4-8) / SOC (cols 9-13) group headers
+writeData(wb2, 1, agc_pool_label, startRow = 1, startCol = 4)
+writeData(wb2, 1, soc_pool_label, startRow = 1, startCol = 9)
+mergeCells(wb2, 1, cols = 4:8,  rows = 1)
+mergeCells(wb2, 1, cols = 9:13, rows = 1)
+
+# Top rule (all cols) + bold/centered for group label cells
+grp_style <- createStyle(fontName = "Calibri", fontSize = 11,
+                         border = "top", borderStyle = "medium",
+                         textDecoration = "bold", halign = "center")
+addStyle(wb2, 1, grp_style, rows = 1, cols = 1:13, gridExpand = TRUE)
+
+# Thin underline beneath AGC / SOC labels only
+grp_underline <- createStyle(border = "bottom", borderStyle = "thin")
+addStyle(wb2, 1, grp_underline, rows = 1, cols = 4:13, gridExpand = TRUE, stack = TRUE)
+
+# Row 2: column headers — medium rule underneath, bold, centered
+col_headers <- c("Predictor", "Source", "Type",
+                 "Coverage", "n", "R\u00B2", "p", "sig.",
+                 "Coverage", "n", "R\u00B2", "p", "sig.")
+for (i in seq_along(col_headers)) {
+  writeData(wb2, 1, col_headers[i], startRow = 2, startCol = i)
+}
+
+col_style <- createStyle(fontName = "Calibri", fontSize = 10,
+                         textDecoration = "bold",
+                         border = "bottom", borderStyle = "medium",
+                         halign = "center")
+addStyle(wb2, 1, col_style, rows = 2, cols = 1:13, gridExpand = TRUE)
+
+# Italic override for "p" header cells (cols 7 and 12)
+p_style <- createStyle(fontName = "Calibri", fontSize = 10,
+                       textDecoration = c("bold", "italic"),
+                       border = "bottom", borderStyle = "medium",
+                       halign = "center")
+addStyle(wb2, 1, p_style, rows = 2, cols = c(7, 12), gridExpand = TRUE)
+
+# Bottom rule after last data row
+bot_style <- createStyle(border = "bottom", borderStyle = "medium")
+addStyle(wb2, 1, bot_style, rows = last_data_row, cols = 1:13, gridExpand = TRUE)
+
+# Footnote row explaining the low-n asterisk
+footnote_row <- last_data_row + 2
+writeData(wb2, 1, low_n_footnote, startRow = footnote_row, startCol = 1)
+mergeCells(wb2, 1, cols = 1:13, rows = footnote_row)
+footnote_style <- createStyle(fontName = "Calibri", fontSize = 9, textDecoration = "italic")
+addStyle(wb2, 1, footnote_style, rows = footnote_row, cols = 1:13, gridExpand = TRUE)
+
+setColWidths(wb2, 1, cols = 1,             widths = 30)
+setColWidths(wb2, 1, cols = 2,             widths = 35)
+setColWidths(wb2, 1, cols = 3,             widths = 22)
+setColWidths(wb2, 1, cols = c(4, 9),       widths = 13)
+setColWidths(wb2, 1, cols = c(5:8, 10:13), widths = 8)
+
+saveWorkbook(wb2, file.path(out_dir, "predictor_summary_table.xlsx"), overwrite = TRUE)
+```
