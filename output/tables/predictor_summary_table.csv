@@ -1,0 +1,31 @@
+,,,AGC,,,,,ΔSOC,,,,
+Predictor,Source,Type,Coverage,n,R2,p,sig.,Coverage,n,R2,p,sig.
+Agroforestry category,Literature,Categorical,100%,6357,0.16,<0.01,***,100%,1028,0.05,<0.01,***
+Age (years),Literature,Continuous,100%,6599,0.22,0.00,***,100%,1036,0.01,<0.01,***
+Prior land use,Literature,Categorical,60%,6599,0.08,<0.01,***,59%,1036,0.03,<0.01,***
+Control land use (SOC only),Literature,Categorical,NA,NA,NA,NA,,77%,1036,0.02,<0.01,***
+Ecoregion,Audebert (2024),Categorical,99%,6562,0.03,<0.01,***,95%,973,<0.01,0.51,
+Elevation (m),"Literature, Worldclim",Continuous,99%,6565,0.01,<0.01,***,95%,989,<0.01,0.16,
+Mean annual precipitation (mm),"Literature, Worldclim",Continuous,100%,6582,0.05,<0.01,***,96%,996,<0.01,0.73,
+Mean annual temperature (°C),"Literature, Worldclim",Continuous,99%,6566,<0.01,0.02,*,95%,988,<0.01,0.84,
+Trees per hectare,Literature,Continuous,67%,4416,0.03,<0.01,***,69%,713,<0.01,0.52,
+Tree species diversity,Literature,Continuous,98%,6497,<0.01,0.81,,96%,997,<0.01,0.04,*
+Sand (%),"Literature, Soilgrids",Continuous,99%,6542,0.01,<0.01,***,99%,1027,<0.01,0.07,
+Silt (%),"Literature, Soilgrids",Continuous,99%,6542,<0.01,<0.01,***,99%,1027,<0.01,0.18,
+Clay (%),"Literature, Soilgrids",Continuous,99%,6542,<0.01,0.01,*,99%,1027,<0.01,0.40,
+Management: Pruning,Literature,Binary,27%,1795,0.03,<0.01,***,21%,219,<0.01,0.51,
+Management: Weed control,Literature,Binary,30%,1991,0.01,<0.01,***,12%,124,0.03,0.05,
+Management: Tillage,Literature,Binary,4%,273†,0.35,<0.01,***,6%,67†,0.01,0.37,
+Management: Grazers,Literature,Binary,3%,215†,0.01,0.20,,10%,103†,0.08,<0.01,**
+Management: Burning,Literature,Binary,1%,76†,0.02,0.18,,3%,28†,0.06,0.20,
+Management: Litter,Literature,Binary,4%,233†,<0.01,0.90,,12%,128,0.06,0.01,**
+Management: Pest control,Literature,Binary,5%,298†,0.21,<0.01,***,4%,44†,0.22,<0.01,**
+Management: Fertilizer,Literature,Binary,50%,3285,<0.01,<0.01,***,35%,367,<0.01,0.51,
+Management: Irrigation,Literature,Binary,24%,1597,<0.01,0.44,,6%,62†,0.08,0.03,*
+Avg. vegetation height (m),TryDB,Continuous,56%,3693,0.02,<0.01,***,66%,681,0.01,0.04,*
+Specific leaf area (mm²/mg),TryDB,Continuous,61%,4044,0.01,<0.01,***,70%,726,<0.01,0.15,
+Nitrogen fixer,TryDB,Binary,51%,3346,0.03,<0.01,***,63%,650,0.01,0.01,**
+Mycorrhizal fungi: AM,TryDB,Binary,51%,3344,0.01,<0.01,***,63%,649,<0.01,0.53,
+Mycorrhizal fungi: ECM,TryDB,Binary,51%,3344,0.03,<0.01,***,63%,649,0.01,0.05,
+Tolerance to freezing,TryDB,Binary,64%,4205,0.01,<0.01,***,80%,826,<0.01,0.20,
+"† n represents less than 10% of the full sample for that carbon pool; the estimate is based on a small, likely non-random subsample of studies (predictors like management practices are only reported by a handful of studies) and should be interpreted with caution."

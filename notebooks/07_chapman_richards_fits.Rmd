@@ -1,0 +1,1183 @@
+---
+title: "07 - Chapman-Richards growth curve fits"
+output: html_document
+---
+
+**Purpose.** Fit Chapman-Richards (C-R) growth curves of carbon vs. stand age, `C = a * (1 - exp(-b * age))^c`, for AGC stocks and for the SOC difference between agroforestry and control plots (ΔSOC), by climate region (ecoregion) x agroforestry category. It reports stock at maturity, age at maturity, and growth rate with bootstrap confidence intervals.
+
+**Model.** The model is reparameterised for fitting: `a = y_ref * plogis(alpha)`, where `y_ref` is the 0.95 quantile of the response in the partition, and `b` is derived from `t95`, the age at which 95% of `a` is reached (bounded to 5-80 years), with `c` bounded to 1.5-3. Fits use a brute-force start-value search (`nls2`) followed by bounded Levenberg-Marquardt (`minpack.lm::nlsLM`). Partitions with n < 15, failed fits, or negative R² are flagged in the `Reason` column and dropped from the filtered tables. Stock at maturity is the asymptote `a`. Age at maturity is the age at which 90% of `a` is reached (`t90 = -log(1 - 0.9^(1/c)) / b`). Growth rate is the mean annual increment to that age (`0.9 * a / t90`). 95% CIs for `a` and growth rate come from a case bootstrap (B = 300). Ecoregion panel figures show curve confidence bands from the delta method and, as an alternative, from a case bootstrap (B = 500). AGC fits (tables and figures) are weighted by stand age; SOC fits are unweighted. Random seeds are set at the start of each bootstrap chunk so results are reproducible.
+
+**Inputs.**
+
+- `output/data/{agc,agc_change,bgc,bgc_change,soc,soc_change}_by_plot_and_age_w_covars_drop_outliers.xlsx` (notebook 04). `agc` and `soc` are used for the curve fits; `agc_change` and `soc_change` give the observed mean annual change rate columns in the fit tables.
+
+**Outputs.**
+
+- `output/tables/agc_cr_fit_table.xlsx`, `output/tables/agc_cr_fit_table_filtered.xlsx` (the filtered table is used by notebooks 08 and 10). Fit tables have two header rows (curve-fit vs. observed annual change rate column groups), so read them with `startRow = 2`.
+- `output/tables/soc_cr_fit_table.xlsx`, `output/tables/soc_cr_fit_table_filtered.xlsx`
+- `output/figures/agc_cr_fit_by_af_cat_all_reg_panel.png`, `agc_cr_fit_by_er_all_af_cat_panel.png`, `agc_cr_fit_by_er_all_af_cat_panel_boot.png`
+- `output/figures/soc_delta_cr_fit_by_af_cat_all_reg_panel.png`, `soc_delta_cr_fit_by_er_all_af_cat_panel.png`, `soc_delta_cr_fit_by_er_all_af_cat_panel_boot.png`
+
+```{r setup}
+library(here)
+library(tidyverse)
+library(openxlsx)
+library(skimr)
+library(ggpmisc)
+library(patchwork)
+library(forcats)
+library(broom)
+library(emmeans)
+library(minpack.lm)
+library(nls2)
+```
+
+Load the final plot-level analysis datasets.
+```{r load-data}
+agc_df <- read.xlsx(here("output", "data", "agc_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+agc_change_df <- read.xlsx(here("output", "data", "agc_change_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+bgc_df <- read.xlsx(here("output", "data", "bgc_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+bgc_change_df <- read.xlsx(here("output", "data", "bgc_change_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+soc_df <- read.xlsx(here("output", "data", "soc_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+soc_change_df <- read.xlsx(here("output", "data", "soc_change_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+```
+
+
+Analysis options: AF categories to fit and carbon pool labels.
+```{r options}
+af_cats <- c('AC', 'BP', 'COP', 'FAL', 'FOD', 'MS', 'PAR', 'ROT', 'SA', 'SP', 'SPC', 'TMC', 'WL', 'ALL')
+
+c_data_names <- c('agc', 'bgc', 'soc', 'agc_change', 'bgc_change', 'soc_change')
+c_data_labels <- c('agc' = "AGC", 'bgc' = "BGC", 'soc' = "SOC", 'agc_change' = "AGC change", 'bgc_change' = "BGC change", 'soc_change' = "SOC change")
+dep_var_labels <- c('c_t_ha' = 'C stock (t/Ha)', 'c_t_ha_yr' = 'C change (t/Ha/yr)')
+```
+
+Helper: case-bootstrap 95% CI for the C-R parameter `a` (stock at maturity) and
+the "growth rate" metric (mean annual increment to 90% of maturity). Re-used
+by every region x af_cat fit in the loops below. Uses the already-fitted
+model's coefficients as a warm start (no brute-force search per replicate),
+so it is much cheaper than the full-curve bootstrap used for the ecoregion panel plots.
+```{r cr-param-ci}
+fit_cr_param_ci <- function(my_df, dep_var, warm_start, weight_var = NULL,
+                             B = 300, alpha_level = 0.05,
+                             t95_lower = 5, t95_upper = 80) {
+
+  cr_form <- as.formula(paste0(
+    dep_var, " ~ (y_ref * plogis(alpha)) *",
+    " (1 - exp(-(-log(1 - 0.95^(1/c)) / t95) * age))^c"
+  ))
+
+  age_at_frac_ci <- function(frac, b, c) -log(1 - frac^(1 / c)) / b
+  mai_to_frac_ci <- function(frac, a, b, c) {
+    t_x <- age_at_frac_ci(frac, b, c)
+    (frac * a) / t_x
+  }
+
+  a_boot      <- rep(NA_real_, B)
+  growth_boot <- rep(NA_real_, B)
+
+  for (b in seq_len(B)) {
+    resamp <- my_df[sample(nrow(my_df), nrow(my_df), replace = TRUE), ]
+    y_ref  <- as.numeric(quantile(resamp[[dep_var]], 0.95, na.rm = TRUE))
+    w      <- if (!is.null(weight_var)) resamp[[weight_var]] else rep(1, nrow(resamp))
+
+    fit_b <- try(nlsLM(cr_form, data = resamp, start = warm_start,
+      weights = w,
+      lower = c(alpha = -20, t95 = t95_lower, c = 1.5),
+      upper = c(alpha =  20, t95 = t95_upper, c = 3),
+      control = nls.lm.control(maxiter = 200, ftol = 1e-7, ptol = 1e-7)),
+      silent = TRUE)
+
+    if (inherits(fit_b, "try-error")) next
+
+    co_b <- coef(fit_b)
+    a_b  <- y_ref * plogis(co_b[["alpha"]])
+    b_b  <- -log(1 - 0.95^(1 / co_b[["c"]])) / co_b[["t95"]]
+    c_b  <- co_b[["c"]]
+
+    a_boot[b]      <- a_b
+    growth_boot[b] <- tryCatch(mai_to_frac_ci(0.9, a_b, b_b, c_b), error = function(e) NA_real_)
+  }
+
+  ok    <- !is.na(a_boot) & !is.na(growth_boot)
+  n_ok  <- sum(ok)
+
+  if (n_ok < B * 0.5) {
+    return(list(a_lwr = NA_real_, a_upr = NA_real_,
+                growth_lwr = NA_real_, growth_upr = NA_real_, n_ok = n_ok))
+  }
+
+  list(
+    a_lwr      = as.numeric(quantile(a_boot[ok], alpha_level / 2)),
+    a_upr      = as.numeric(quantile(a_boot[ok], 1 - alpha_level / 2)),
+    growth_lwr = as.numeric(quantile(growth_boot[ok], alpha_level / 2)),
+    growth_upr = as.numeric(quantile(growth_boot[ok], 1 - alpha_level / 2)),
+    n_ok       = n_ok
+  )
+}
+```
+
+
+Fit C-R curves of AGC stock vs. age for each ecoregion x AF category combination (asymptote reference = 0.95 quantile of values in the partition; age-weighted fits), with bootstrap CIs for `a` and growth rate.
+```{r agc-fits, fig.width=7, fig.height=7}
+set.seed(4817)
+c_data_name <- 'agc'
+dep_var_name <- 'c_t_ha'
+cont_var <- "age"
+
+audebert_regs <- get(paste0(c_data_name, '_df')) %>%
+  pull(ecoregion) %>% unique()
+audebert_regs <- audebert_regs[!is.na(audebert_regs)]
+audebert_regs <- c(audebert_regs, "ALL", "Tropical/subtropical all", "Temperate all")
+
+# Map combined region labels to the underlying ecoregion values
+combined_regs <- list(
+  "Tropical/subtropical all" = c("Tropical/subtropical wet", "Tropical/subtropical dry"),
+  "Temperate all"            = c("Temperate wet", "Temperate dry")
+)
+
+global_age_max <- get(paste0(c_data_name, '_df')) %>%
+  pull(.data[[cont_var]]) %>% max(na.rm = TRUE)
+
+agc_plot_list <- list()
+agc_out_df <- tibble()
+
+for (my_audebert_reg in audebert_regs) {
+  for (my_af_cat in af_cats) {
+    
+    my_comb_lab <- paste0(my_audebert_reg, '; ', my_af_cat)
+    message(my_comb_lab)
+    
+    # For combined regions, expand to constituent region values
+    reg_vals <- if (!is.null(combined_regs[[my_audebert_reg]])) combined_regs[[my_audebert_reg]] else my_audebert_reg
+    
+    if (my_audebert_reg == 'ALL' && my_af_cat == 'ALL') {
+      my_c_df <- get(paste0(c_data_name, '_df')) %>%
+        filter(!is.na(.data[[dep_var_name]]), !is.na(.data[[cont_var]]))
+    } else if (my_audebert_reg == 'ALL') {
+      my_c_df <- get(paste0(c_data_name, '_df')) %>%
+        filter(af_cat == my_af_cat) %>%
+        filter(!is.na(.data[[dep_var_name]]), !is.na(.data[[cont_var]]))
+    } else if (my_af_cat == 'ALL') {
+      my_c_df <- get(paste0(c_data_name, '_df')) %>%
+        filter(ecoregion %in% reg_vals) %>%
+        filter(!is.na(.data[[dep_var_name]]), !is.na(.data[[cont_var]]))
+    } else {
+      my_c_df <- get(paste0(c_data_name, '_df')) %>%
+        filter(ecoregion %in% reg_vals) %>%
+        filter(af_cat == my_af_cat) %>%
+        filter(!is.na(.data[[dep_var_name]]), !is.na(.data[[cont_var]]))
+    }
+    
+    my_n <- nrow(my_c_df)
+    
+    insuff_dat <- FALSE
+    if (my_n < 15) insuff_dat <- TRUE
+    
+    no_data_reason <- NA_character_
+    if (insuff_dat) no_data_reason <- "Insufficient data"
+    
+    fit_ok <- FALSE
+    
+    if (!insuff_dat) {
+      
+      # asymptote cap at 0.95 quantile; weights by age prioritise mature systems
+      q_cap <- 0.95
+      y_max_obs <- max(my_c_df[[dep_var_name]], na.rm = TRUE)
+      y_q <- quantile(my_c_df[[dep_var_name]], q_cap, na.rm = TRUE)
+      y_ref <- as.numeric(y_q)
+      
+      # starting values based on capped reference
+      a_start <- y_q
+      a_frac_start <- min(max(as.numeric(a_start / y_ref), 1e-6), 0.99)
+      alpha_start <- qlogis(a_frac_start)
+      
+      my_age_max <- max(my_c_df$age, na.rm = TRUE)
+      
+      t95_lower <- 5
+      t95_upper <- 80
+      
+      c_start <- 2
+      b_start <- 1 / max(median(my_c_df$age, na.rm = TRUE), 1e-6)
+      t95_start <- -log(1 - 0.95^(1 / c_start)) / max(b_start, 1e-8)
+      
+      t95_grid <- seq(t95_lower, t95_upper, length.out = 7)
+      
+      start_grid <- expand.grid(
+        alpha = seq(qlogis(0.005), qlogis(0.995), length.out = 15),
+        t95   = t95_grid,
+        c     = seq(1.5, 3, length.out = 5)
+      )
+      
+      cr_nls2 <- try(
+        nls2(
+          c_t_ha ~ (y_ref * plogis(alpha)) *
+            (1 - exp(-(-log(1 - 0.95^(1/c)) / t95) * age))^c,
+          data = my_c_df,
+          start = start_grid,
+          weights = my_c_df[[cont_var]],
+          algorithm = "brute-force",
+          control = nls.control(maxiter = 50, warnOnly = TRUE)
+        ),
+        silent = TRUE
+      )
+      
+      best_start <- if (!inherits(cr_nls2, "try-error")) {
+        as.list(coef(cr_nls2))
+      } else {
+        list(alpha = alpha_start, t95 = t95_start, c = c_start)
+      }
+      
+      cr_fit <- try(
+        nlsLM(
+          c_t_ha ~ (y_ref * plogis(alpha)) *
+            (1 - exp(-(-log(1 - 0.95^(1/c)) / t95) * age))^c,
+          data = my_c_df,
+          start = best_start,
+          weights = my_c_df[[cont_var]],
+          lower = c(alpha = -20, t95 = t95_lower, c = 1.5),
+          upper = c(alpha =  20, t95 = t95_upper, c = 3),
+          control = nls.lm.control(maxiter = 500, ftol = 1e-10, ptol = 1e-10)
+        ),
+        silent = TRUE
+      )
+      
+      if (!inherits(cr_fit, "try-error")) {
+        fit_ok <- TRUE
+      } else {
+        message("fit failed: ", attr(cr_fit, "condition")$message)
+        no_data_reason <- "Fit failed"
+      }
+    }
+    
+    if (fit_ok) {
+      
+      b_from_t95 <- function(t95, c) {
+        -log(1 - 0.95^(1 / c)) / t95
+      }
+      
+      co <- coef(cr_fit)
+      a_hat <- y_ref * plogis(co["alpha"])
+      b_hat <- b_from_t95(co["t95"], co["c"])
+      c_hat <- co["c"]
+      
+      age_grid <- tibble(!!cont_var := 0:global_age_max) %>%
+        mutate(chapman_curve = as.numeric(predict(cr_fit, newdata = .)))
+      
+      ageinfl <- (1 / b_hat) * log(c_hat)
+      
+      age_at_frac <- function(frac, a, b, c) {
+        -log(1 - frac^(1 / c)) / b
+      }
+      
+      mai_to_frac <- function(frac, a, b, c) {
+        t_x <- age_at_frac(frac, a, b, c)
+        (frac * a) / t_x
+      }
+      
+      t90 <- age_at_frac(0.9, a_hat, b_hat, c_hat)
+      mai90 <- mai_to_frac(0.9, a_hat, b_hat, c_hat)
+      
+      rmse <- sqrt(mean((my_c_df[[dep_var_name]] - predict(cr_fit))^2))
+      mae <- mean(abs(my_c_df[[dep_var_name]] - predict(cr_fit)))
+      ss_res <- sum((my_c_df[[dep_var_name]] - predict(cr_fit))^2)
+      ss_tot <- sum((my_c_df[[dep_var_name]] - mean(my_c_df[[dep_var_name]]))^2)
+      r_squared <- 1 - ss_res / ss_tot
+      
+      if (r_squared < 0) {
+        fit_ok <- FALSE
+        no_data_reason <- "Negative R\u00b2"
+        a_hat <- NA; b_hat <- NA; c_hat <- NA
+        ageinfl <- NA; t90 <- NA; mai90 <- NA
+        rmse <- NA; mae <- NA; r_squared <- NA
+      }
+      
+    } else {
+      a_hat <- NA; b_hat <- NA; c_hat <- NA
+      ageinfl <- NA; t90 <- NA; mai90 <- NA
+      rmse <- NA; mae <- NA; r_squared <- NA
+    }
+    
+    # Bootstrap 95% CI for a (stock at maturity) and growth rate (MAI to 90% maturity)
+    if (fit_ok) {
+      ci_res <- fit_cr_param_ci(
+        my_df = my_c_df, dep_var = dep_var_name,
+        warm_start = as.list(coef(cr_fit)), weight_var = cont_var, B = 300
+      )
+      a_ci_lwr <- ci_res$a_lwr;        a_ci_upr <- ci_res$a_upr
+      growth_ci_lwr <- ci_res$growth_lwr; growth_ci_upr <- ci_res$growth_upr
+      boot_n_ok <- ci_res$n_ok
+    } else {
+      a_ci_lwr <- NA; a_ci_upr <- NA
+      growth_ci_lwr <- NA; growth_ci_upr <- NA
+      boot_n_ok <- NA
+    }
+    
+    plot_obj <- ggplot(my_c_df, aes(x = !!sym(cont_var), y = !!sym(dep_var_name))) +
+      geom_point(size = .5, alpha = .75, fill = 'black', stroke = 0) +
+      { if (fit_ok) geom_line(data = age_grid, aes(y = chapman_curve),
+                              color = "deepskyblue4", linewidth = .75) } +
+      scale_y_continuous(limits = c(0, 140), expand = expansion(mult = c(0, 0))) +
+      xlim(0, 100) + # setting age limit for plot to 100y for better viz, even though there are a few outliers.  
+      labs(title = my_af_cat, x = "Age", y = expression(AGC~(Mg~ha^{-1}))) +
+      { if (!fit_ok) labs(title = paste0(my_af_cat, ' (', no_data_reason, ')')) } +
+      { if (fit_ok) annotate("label", x = 99, y = 130,
+          label = paste0("a = ", round(a_hat, 2), "\nb = ", round(b_hat, 4), "\nc = ", round(c_hat, 2),
+                         "\nRMSE = ", round(rmse, 2), "\nR\u00b2 = ", round(r_squared, 2)),
+          hjust = 1, vjust = 1, size = 2.5,
+          fill = alpha("white", 0.8), label.size = 0,
+          label.padding = unit(0.15, "lines")) } +
+      theme_minimal(base_size = 10)
+    
+    agc_plot_list[[my_audebert_reg]][[my_af_cat]] <- plot_obj
+    
+    agc_out_df <- agc_out_df %>% bind_rows(tibble(
+      ecoregion = my_audebert_reg,
+      af_cat = my_af_cat,
+      n = my_n,
+      asymptotic_max_a = a_hat,
+      a_ci_lwr = a_ci_lwr,
+      a_ci_upr = a_ci_upr,
+      growth_rate_b = b_hat,
+      curve_shape_c = c_hat,
+      age_max_growth = ageinfl,
+      age_90_pct = t90,
+      avg_growth_rate_to_90 = mai90,
+      growth_rate_ci_lwr = growth_ci_lwr,
+      growth_rate_ci_upr = growth_ci_upr,
+      boot_n_ok = boot_n_ok,
+      rmse = rmse,
+      mae = mae,
+      r_squared = r_squared,
+      no_data_reason = no_data_reason
+    ))
+  }
+}
+
+
+# print plots
+
+# full battery of plots
+for (my_audebert_reg in audebert_regs) {
+  combined_plot <- wrap_plots(agc_plot_list[[my_audebert_reg]], ncol = 2, axes = 'collect', axis_titles = 'collect') +
+    plot_annotation(title = my_audebert_reg)
+  suppressWarnings(print(combined_plot))
+}
+
+# panel plot with only "ALL" audebert regions
+agc_plot_list_all_reg <- list()
+for (my_af_cat in af_cats) {
+  reason <- agc_out_df |> filter(ecoregion == 'ALL', af_cat == my_af_cat) |> pull(no_data_reason)
+  reason_suffix <- if (length(reason) > 0 && !is.na(reason[1])) paste0(' (', reason[1], ')') else ''
+  base_title <- if (my_af_cat == 'ALL') 'All AF categories' else my_af_cat
+  agc_plot_list_all_reg[[my_af_cat]] <- agc_plot_list[['ALL']][[my_af_cat]] +
+    labs(title = paste0(base_title, reason_suffix))
+}
+agc_combined_plot_all_reg <- wrap_plots(agc_plot_list_all_reg, ncol = 2, axes = 'collect', axis_titles = 'collect')
+suppressWarnings(print(agc_combined_plot_all_reg))
+ggsave(here("output", "figures", "agc_cr_fit_by_af_cat_all_reg_panel.png"), plot = agc_combined_plot_all_reg, width = 7, height = 5, dpi = 600)
+```
+
+
+AGC vs. age panel by ecoregion (all AF categories pooled), with delta-method 95% confidence bands.
+```{r agc-er-panel, fig.width = 7, fig.height = 7}
+# Panel: AGC vs age by ecoregion — single colour, 95% CI band on curve (delta method)
+
+# Helper: re-fit Chapman-Richards for a data subset and return CI band tibble.
+# Returns NULL if data is insufficient or fit fails.
+fit_cr_bands <- function(my_df, dep_var, age_seq = seq(0, 100, by = 0.5),
+                         alpha_level = 0.05, weighted = TRUE) {
+  my_df <- my_df |> filter(!is.na(.data[[dep_var]]), !is.na(age))
+  if (nrow(my_df) < 15) return(NULL)
+  # Age-weighted to match the AGC table fits; SOC fits are unweighted
+  w <- if (weighted) my_df$age else rep(1, nrow(my_df))
+
+  y_ref     <- as.numeric(quantile(my_df[[dep_var]], 0.95, na.rm = TRUE))
+  c_start   <- 2
+  b_start   <- 1 / max(median(my_df$age, na.rm = TRUE), 1e-6)
+  t95_lower <- 5; t95_upper <- 80
+  t95_start <- -log(1 - 0.95^(1 / c_start)) / max(b_start, 1e-8)
+  alpha_start <- qlogis(min(max(quantile(my_df[[dep_var]], 0.95) / y_ref, 1e-6), 0.99))
+
+  start_grid <- expand.grid(
+    alpha = seq(qlogis(0.005), qlogis(0.995), length.out = 15),
+    t95   = seq(t95_lower, t95_upper, length.out = 7),
+    c     = seq(1.5, 3, length.out = 5)
+  )
+  cr_form <- as.formula(paste0(
+    dep_var, " ~ (y_ref * plogis(alpha)) *",
+    " (1 - exp(-(-log(1 - 0.95^(1/c)) / t95) * age))^c"
+  ))
+
+  cr_nls2 <- try(nls2(cr_form, data = my_df, start = start_grid,
+    weights = w, algorithm = "brute-force",
+    control = nls.control(maxiter = 50, warnOnly = TRUE)), silent = TRUE)
+
+  best <- if (!inherits(cr_nls2, "try-error")) as.list(coef(cr_nls2)) else
+    list(alpha = alpha_start, t95 = t95_start, c = c_start)
+
+  cr_fit <- try(nlsLM(cr_form, data = my_df, start = best,
+    weights = w,
+    lower = c(alpha = -20, t95 = t95_lower, c = 1.5),
+    upper = c(alpha =  20, t95 = t95_upper, c = 3),
+    control = nls.lm.control(maxiter = 500, ftol = 1e-10, ptol = 1e-10)),
+    silent = TRUE)
+
+  if (inherits(cr_fit, "try-error")) return(NULL)
+
+  r_sq <- 1 - sum((my_df[[dep_var]] - predict(cr_fit))^2) /
+              sum((my_df[[dep_var]] - mean(my_df[[dep_var]]))^2)
+  if (r_sq < 0) return(NULL)
+
+  params <- coef(cr_fit)
+  V      <- vcov(cr_fit)
+  t_crit <- qt(1 - alpha_level / 2, df = nrow(my_df) - length(params))
+
+  pred_fn <- function(par, age) {
+    a_v <- y_ref * plogis(par[["alpha"]])
+    b_v <- -log(1 - 0.95^(1 / par[["c"]])) / par[["t95"]]
+    a_v * (1 - exp(-b_v * age))^par[["c"]]
+  }
+
+  # Numerical Jacobian via central differences
+  h   <- sqrt(.Machine$double.eps) * abs(params) + 1e-8
+  jac <- matrix(NA_real_, nrow = length(age_seq), ncol = length(params))
+  for (j in seq_along(params)) {
+    pp <- params; pp[j] <- params[j] + h[j]
+    pm <- params; pm[j] <- params[j] - h[j]
+    jac[, j] <- (pred_fn(pp, age_seq) - pred_fn(pm, age_seq)) / (2 * h[j])
+  }
+
+  se <- sqrt(pmax(0, rowSums((jac %*% V) * jac)))
+  y  <- pred_fn(params, age_seq)
+  tibble(age = age_seq, fit = y, lwr = y - t_crit * se, upr = y + t_crit * se)
+}
+
+desired_order_er <- c("Tropical/subtropical wet", "Tropical/subtropical dry",
+                      "Temperate wet", "Temperate dry", "Boreal/polar", "ALL")
+
+agc_panel_list <- list()
+
+for (my_audebert_reg in desired_order_er) {
+  my_data <- if (my_audebert_reg == "ALL") agc_df else
+    agc_df |> filter(ecoregion == my_audebert_reg)
+
+  bands        <- fit_cr_bands(my_data, dep_var = "c_t_ha")
+  scatter      <- my_data |> filter(!is.na(c_t_ha), !is.na(age))
+  panel_title  <- if (my_audebert_reg == "ALL") "All ecoregions" else my_audebert_reg
+
+  agc_panel_list[[my_audebert_reg]] <- ggplot(scatter, aes(x = age, y = c_t_ha)) +
+    { if (!is.null(bands))
+        geom_ribbon(data = bands, aes(x = age, ymin = lwr, ymax = upr),
+                    inherit.aes = FALSE, fill = "deepskyblue4", alpha = 0.2) } +
+    geom_point(size = 0.85, alpha = 0.5, shape = 16, stroke = 0, color = "grey40") +
+    { if (!is.null(bands))
+        geom_line(data = bands, aes(x = age, y = fit),
+                  color = "deepskyblue4", linewidth = 0.85, inherit.aes = FALSE) } +
+    scale_y_continuous(limits = c(0, 140), expand = expansion(mult = c(0, 0))) +
+    xlim(0, 100) +
+    labs(title = panel_title, x = "Age (years)", y = expression(AGC~(Mg~ha^{-1}))) +
+    theme_minimal(base_size = 9) +
+    theme(plot.title       = element_text(size = 8, face = "bold"),
+          axis.title       = element_text(size = 8),
+          panel.grid.minor = element_blank())
+}
+
+agc_er_panel <- wrap_plots(agc_panel_list, ncol = 2, axes = "collect", axis_titles = "collect")
+suppressWarnings(print(agc_er_panel))
+ggsave(here("output", "figures", "agc_cr_fit_by_er_all_af_cat_panel.png"),
+       plot = agc_er_panel, width = 7, height = 7, dpi = 600, bg = "white")
+```
+
+
+Write the AGC C-R fit tables: all region x AF category combinations, and a filtered version with successful fits only (used by notebooks 08 and 10). Each table has two header rows: the fitted-curve columns, and the observed mean annual change rate for the same partition, computed directly from the plot-level change rates in `agc_change_df` (`c_t_ha_yr`; mean, SE, and t-based 95% CI). Downstream readers use `startRow = 2`.
+```{r agc-fit-tables}
+# Helper: write a data frame to Excel with academic table formatting: an
+# optional row of merged group headers (header_groups = named column counts;
+# "" = no label), bold column header with borders, bottom border after the
+# last row. Header and cell text may contain line breaks ("\n"): text wraps,
+# column widths follow the longest line and row heights the number of lines.
+write_pub_table <- function(df, file_path, header_groups = NULL) {
+  wb <- createWorkbook()
+  addWorksheet(wb, "Sheet1")
+  n_cols <- ncol(df)
+  n_rows <- nrow(df)
+  head_row <- if (is.null(header_groups)) 1 else 2
+  line_h <- 15  # points per line (Calibri 11)
+
+  if (!is.null(header_groups)) {
+    stopifnot(sum(header_groups) == n_cols)
+    group_style <- createStyle(textDecoration = "bold", halign = "center",
+                               border = "top", borderStyle = "medium")
+    addStyle(wb, "Sheet1", group_style, rows = 1, cols = 1:n_cols, gridExpand = TRUE)
+    underline_style <- createStyle(textDecoration = "bold", halign = "center",
+                                   valign = "bottom", wrapText = TRUE,
+                                   border = c("top", "bottom"),
+                                   borderStyle = c("medium", "thin"))
+    start_col <- 1
+    for (i in seq_along(header_groups)) {
+      cols <- start_col:(start_col + header_groups[[i]] - 1)
+      if (nzchar(names(header_groups)[i])) {
+        writeData(wb, "Sheet1", names(header_groups)[i], startRow = 1, startCol = start_col)
+        if (length(cols) > 1) mergeCells(wb, "Sheet1", cols = cols, rows = 1)
+        addStyle(wb, "Sheet1", underline_style, rows = 1, cols = cols, gridExpand = TRUE)
+      }
+      start_col <- start_col + header_groups[[i]]
+    }
+    group_lines <- max(lengths(strsplit(names(header_groups), "\n")))
+    setRowHeights(wb, "Sheet1", rows = 1, heights = group_lines * line_h)
+  }
+
+  writeData(wb, "Sheet1", df, startRow = head_row, startCol = 1, na.string = "")
+  header_style <- createStyle(
+    textDecoration = "bold", valign = "bottom", wrapText = TRUE,
+    border        = if (is.null(header_groups)) c("top", "bottom") else "bottom",
+    borderStyle   = "medium"
+  )
+  addStyle(wb, "Sheet1", header_style, rows = head_row, cols = 1:n_cols, gridExpand = TRUE)
+
+  data_rows <- head_row + seq_len(n_rows)
+  addStyle(wb, "Sheet1", createStyle(valign = "top", wrapText = TRUE),
+           rows = data_rows, cols = 1:n_cols, gridExpand = TRUE)
+  bottom_style <- createStyle(border = "bottom", borderStyle = "medium")
+  addStyle(wb, "Sheet1", bottom_style, rows = n_rows + head_row, cols = 1:n_cols,
+           gridExpand = TRUE, stack = TRUE)
+
+  # Column width: longest header line (bold, ~10% wider) or longest value
+  disp_nchar <- function(x) {
+    x <- x[!is.na(x)]
+    if (!length(x)) return(0)
+    if (is.numeric(x)) x <- format(x, trim = TRUE, drop0trailing = TRUE)
+    max(nchar(unlist(strsplit(as.character(x), "\n"))))
+  }
+  hdr_lines <- strsplit(names(df), "\n")
+  hdr_w <- vapply(hdr_lines, \(l) max(nchar(l)), 0) * 1.1
+  dat_w <- vapply(df, disp_nchar, 0)
+  setColWidths(wb, "Sheet1", cols = 1:n_cols, widths = ceiling(pmax(hdr_w, dat_w)) + 1.5)
+  setRowHeights(wb, "Sheet1", rows = head_row, heights = max(lengths(hdr_lines)) * line_h)
+
+  chr <- vapply(df, is.character, TRUE)
+  cell_lines <- if (any(chr)) {
+    do.call(pmax, lapply(df[chr], \(x) ifelse(is.na(x), 1L, lengths(strsplit(x, "\n")))))
+  } else rep(1L, n_rows)
+  multi <- which(cell_lines > 1)
+  if (length(multi)) setRowHeights(wb, "Sheet1", rows = data_rows[multi], heights = cell_lines[multi] * line_h)
+
+  ok <- saveWorkbook(wb, file_path, overwrite = TRUE, returnValue = TRUE)
+  if (!isTRUE(ok)) stop("Could not write ", file_path, " (is it open in Excel?)")
+}
+
+# Observed annual change rate for one region x AF category partition, using
+# the same partition definitions as the fits ("ALL" region = all rows,
+# including those without a region; combined regions expand via combined_regs)
+obs_rate_summary <- function(change_df, region, af_cat_val) {
+  d <- change_df
+  if (region != "ALL") {
+    reg_vals <- if (!is.null(combined_regs[[region]])) combined_regs[[region]] else region
+    d <- d[d$ecoregion %in% reg_vals, ]
+  }
+  if (af_cat_val != "ALL") d <- d[d$af_cat %in% af_cat_val, ]
+  x <- d$c_t_ha_yr[!is.na(d$c_t_ha_yr)]
+  n <- length(x)
+  m <- if (n > 0) mean(x) else NA_real_
+  se <- if (n > 1) sd(x) / sqrt(n) else NA_real_
+  t_crit <- if (n > 1) qt(0.975, df = n - 1) else NA_real_
+  tibble(obs_n = n, obs_mean = m, obs_se = se,
+         obs_ci_lwr = m - t_crit * se, obs_ci_upr = m + t_crit * se)
+}
+
+# Format and write the full and filtered C-R tables for one pool
+write_cr_tables <- function(out_df, change_df, curve_header, file_stem) {
+  region_levels <- c("Tropical/subtropical wet", "Tropical/subtropical dry",
+                     "Tropical/subtropical all", "Temperate wet", "Temperate dry",
+                     "Temperate all", "Boreal/polar", "ALL")
+  obs_df <- out_df |>
+    distinct(ecoregion, af_cat) |>
+    mutate(obs = map2(ecoregion, af_cat, \(r, k) obs_rate_summary(change_df, r, k))) |>
+    unnest(obs)
+
+  tbl <- out_df |>
+    left_join(obs_df, by = c("ecoregion", "af_cat")) |>
+    mutate(ecoregion = factor(ecoregion, levels = region_levels)) |>
+    arrange(ecoregion) |>
+    mutate(
+      ecoregion = if_else(as.character(ecoregion) == "ALL", "All ecoregions", as.character(ecoregion)),
+      af_cat = if_else(af_cat == "ALL", "All AF categories", af_cat)
+    ) |>
+    mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+    # Short display labels keep the table narrow (08 and 10 restore the full ones)
+    mutate(ecoregion = sub("^Tropical/subtropical", "(Sub)tropical", ecoregion),
+           af_cat = if_else(af_cat == "All AF categories", "All cats.", af_cat),
+           no_data_reason = if_else(no_data_reason %in% "Insufficient data", "Insuff. data", no_data_reason))
+
+  fmt <- function(d, include_reason) {
+    d |>
+      dplyr::select('Region' = ecoregion,
+                    'AF\ncategory' = af_cat,
+                    n,
+                    'a (Stock at\nmaturity,\nMg C ha-1)' = asymptotic_max_a,
+                    'a 95% CI\nlower' = a_ci_lwr,
+                    'a 95% CI\nupper' = a_ci_upr,
+                    'b\n(Growth)' = growth_rate_b,
+                    'c\n(Shape)' = curve_shape_c,
+                    'Age at\nmaturity\n(yr)' = age_90_pct,
+                    'Growth rate\n(Mg C\nha-1 yr-1)' = avg_growth_rate_to_90,
+                    'Growth rate\n95% CI\nlower' = growth_rate_ci_lwr,
+                    'Growth rate\n95% CI\nupper' = growth_rate_ci_upr,
+                    'RMSE\n(Mg C\nha-1)' = rmse,
+                    'R²' = r_squared,
+                    any_of(if (include_reason) c('Reason' = "no_data_reason")),
+                    'n\n(rates)' = obs_n,
+                    'Mean\n(Mg C\nha-1 yr-1)' = obs_mean,
+                    'SE' = obs_se,
+                    '95% CI\nlower' = obs_ci_lwr,
+                    '95% CI\nupper' = obs_ci_upr)
+  }
+  groups <- function(include_reason) {
+    setNames(c(2, 12 + include_reason, 5),
+             c("", curve_header, "Observed annual change rate\n(mean of plot-level rates)"))
+  }
+
+  # Full table omits category x region combinations with no stock and no rate data
+  write_pub_table(fmt(filter(tbl, n > 0 | obs_n > 0), TRUE), here("output", "tables", paste0(file_stem, ".xlsx")),
+                  header_groups = groups(TRUE))
+  write_pub_table(fmt(filter(tbl, !is.na(rmse)), FALSE),
+                  here("output", "tables", paste0(file_stem, "_filtered.xlsx")),
+                  header_groups = groups(FALSE))
+}
+
+write_cr_tables(agc_out_df, agc_change_df,
+                curve_header = "Chapman-Richards curve fit (AGC stock vs. stand age)",
+                file_stem = "agc_cr_fit_table")
+```
+
+
+Fit C-R curves of the SOC stock difference between agroforestry and control plots (`c_t_ha_delta`) vs. age for each ecoregion x AF category combination (asymptote reference = 0.95 quantile of values in the partition; unweighted fits), with bootstrap CIs for `a` and growth rate.
+```{r soc-fits, fig.width=7, fig.height=7}
+set.seed(6352)
+c_data_name <- 'soc'
+dep_var_name <- 'c_t_ha_delta'
+cont_var <- "age"
+
+audebert_regs <- get(paste0(c_data_name, '_df')) %>%
+  pull(ecoregion) %>% unique()
+audebert_regs <- audebert_regs[!is.na(audebert_regs)]
+audebert_regs <- c(audebert_regs, "ALL", "Tropical/subtropical all", "Temperate all")
+
+# Map combined region labels to the underlying ecoregion values
+combined_regs <- list(
+  "Tropical/subtropical all" = c("Tropical/subtropical wet", "Tropical/subtropical dry"),
+  "Temperate all"            = c("Temperate wet", "Temperate dry")
+)
+
+global_age_max <- get(paste0(c_data_name, '_df')) %>%
+  pull(.data[[cont_var]]) %>% max(na.rm = TRUE)
+
+soc_plot_list <- list()
+soc_out_df <- tibble()
+
+for (my_audebert_reg in audebert_regs) {
+  for (my_af_cat in af_cats) {
+    
+    my_comb_lab <- paste0(my_audebert_reg, '; ', my_af_cat)
+    message(my_comb_lab)
+    
+    # For combined regions, expand to constituent region values
+    reg_vals <- if (!is.null(combined_regs[[my_audebert_reg]])) combined_regs[[my_audebert_reg]] else my_audebert_reg
+    
+    if (my_audebert_reg == 'ALL' && my_af_cat == 'ALL') {
+      my_c_df <- get(paste0(c_data_name, '_df')) %>%
+        filter(!is.na(.data[[dep_var_name]]), !is.na(.data[[cont_var]]))
+    } else if (my_audebert_reg == 'ALL') {
+      my_c_df <- get(paste0(c_data_name, '_df')) %>%
+        filter(af_cat == my_af_cat) %>%
+        filter(!is.na(.data[[dep_var_name]]), !is.na(.data[[cont_var]]))
+    } else if (my_af_cat == 'ALL') {
+      my_c_df <- get(paste0(c_data_name, '_df')) %>%
+        filter(ecoregion %in% reg_vals) %>%
+        filter(!is.na(.data[[dep_var_name]]), !is.na(.data[[cont_var]]))
+    } else {
+      my_c_df <- get(paste0(c_data_name, '_df')) %>%
+        filter(ecoregion %in% reg_vals) %>%
+        filter(af_cat == my_af_cat) %>%
+        filter(!is.na(.data[[dep_var_name]]), !is.na(.data[[cont_var]]))
+    }
+    
+    my_n <- nrow(my_c_df)
+    
+    insuff_dat <- FALSE
+    if (my_n < 15) insuff_dat <- TRUE
+    
+    no_data_reason <- NA_character_
+    if (insuff_dat) no_data_reason <- "Insufficient data"
+    
+    fit_ok <- FALSE
+    
+    if (!insuff_dat) {
+      
+      # asymptote cap at 0.95 quantile (unlike AGC, the SOC-delta fit is unweighted)
+      q_cap <- 0.95
+      y_max_obs <- max(my_c_df[[dep_var_name]], na.rm = TRUE)
+      y_q <- quantile(my_c_df[[dep_var_name]], q_cap, na.rm = TRUE)
+      y_ref <- as.numeric(y_q)
+      
+      # starting values based on capped reference
+      a_start <- y_q
+      a_frac_start <- min(max(as.numeric(a_start / y_ref), 1e-6), 0.99)
+      alpha_start <- qlogis(a_frac_start)
+      
+      my_age_max <- max(my_c_df$age, na.rm = TRUE)
+      
+      t95_lower <- 5
+      t95_upper <- 80
+      
+      c_start <- 2
+      b_start <- 1 / max(median(my_c_df$age, na.rm = TRUE), 1e-6)
+      t95_start <- -log(1 - 0.95^(1 / c_start)) / max(b_start, 1e-8)
+      
+      t95_grid <- seq(t95_lower, t95_upper, length.out = 7)
+      
+      start_grid <- expand.grid(
+        alpha = seq(qlogis(0.005), qlogis(0.995), length.out = 15),
+        t95   = t95_grid,
+        c     = seq(1.5, 3, length.out = 5)
+      )
+      
+      # Rename response to a fixed name — avoids formula environment scoping
+      # issues with nlsLM when the column name is constructed programmatically
+      my_c_df_nls <- my_c_df
+      my_c_df_nls$y_resp <- my_c_df_nls[[dep_var_name]]
+
+      cr_formula <- y_resp ~ (y_ref * plogis(alpha)) *
+        (1 - exp(-(-log(1 - 0.95^(1/c)) / t95) * age))^c
+
+      cr_nls2 <- try(
+        nls2(
+          cr_formula,
+          data = my_c_df_nls,
+          start = start_grid,
+          algorithm = "brute-force",
+          control = nls.control(maxiter = 50, warnOnly = TRUE)
+        ),
+        silent = TRUE
+      )
+      
+      best_start <- if (!inherits(cr_nls2, "try-error")) {
+        as.list(coef(cr_nls2))
+      } else {
+        list(alpha = alpha_start, t95 = t95_start, c = c_start)
+      }
+
+      cr_fit <- try(
+        nlsLM(
+          cr_formula,
+          data    = my_c_df_nls,
+          start   = best_start,
+          lower   = c(alpha = -20, t95 = t95_lower, c = 1.5),
+          upper   = c(alpha =  20, t95 = t95_upper, c = 3),
+          control = nls.lm.control(maxiter = 500, ftol = 1e-10, ptol = 1e-10)
+        ),
+        silent = TRUE
+      )
+      
+      if (!inherits(cr_fit, "try-error")) {
+        fit_ok <- TRUE
+      } else {
+        message("fit failed: ", attr(cr_fit, "condition")$message)
+        no_data_reason <- "Fit failed"
+      }
+    }
+    
+    if (fit_ok) {
+      
+      b_from_t95 <- function(t95, c) {
+        -log(1 - 0.95^(1 / c)) / t95
+      }
+      
+      co <- coef(cr_fit)
+      a_hat <- y_ref * plogis(co["alpha"])
+      b_hat <- b_from_t95(co["t95"], co["c"])
+      c_hat <- co["c"]
+      
+      age_grid <- tibble(!!cont_var := 0:global_age_max) %>%
+        mutate(chapman_curve = as.numeric(predict(cr_fit, newdata = .)))
+      
+      ageinfl <- (1 / b_hat) * log(c_hat)
+      
+      age_at_frac <- function(frac, a, b, c) {
+        -log(1 - frac^(1 / c)) / b
+      }
+      
+      mai_to_frac <- function(frac, a, b, c) {
+        t_x <- age_at_frac(frac, a, b, c)
+        (frac * a) / t_x
+      }
+      
+      t90 <- age_at_frac(0.9, a_hat, b_hat, c_hat)
+      mai90 <- mai_to_frac(0.9, a_hat, b_hat, c_hat)
+      
+      rmse <- sqrt(mean((my_c_df[[dep_var_name]] - predict(cr_fit))^2))
+      mae <- mean(abs(my_c_df[[dep_var_name]] - predict(cr_fit)))
+      ss_res <- sum((my_c_df[[dep_var_name]] - predict(cr_fit))^2)
+      ss_tot <- sum((my_c_df[[dep_var_name]] - mean(my_c_df[[dep_var_name]]))^2)
+      r_squared <- 1 - ss_res / ss_tot
+      
+      if (r_squared < 0) {
+        fit_ok <- FALSE
+        no_data_reason <- "Negative R\u00b2"
+        a_hat <- NA; b_hat <- NA; c_hat <- NA
+        ageinfl <- NA; t90 <- NA; mai90 <- NA
+        rmse <- NA; mae <- NA; r_squared <- NA
+      }
+      
+    } else {
+      a_hat <- NA; b_hat <- NA; c_hat <- NA
+      ageinfl <- NA; t90 <- NA; mai90 <- NA
+      rmse <- NA; mae <- NA; r_squared <- NA
+    }
+    
+    # Bootstrap 95% CI for a (stock at maturity) and growth rate (MAI to 90% maturity)
+    # NB: SOC-delta fit uses the renamed "y_resp" column and is unweighted.
+    if (fit_ok) {
+      ci_res <- fit_cr_param_ci(
+        my_df = my_c_df_nls, dep_var = "y_resp",
+        warm_start = as.list(coef(cr_fit)), weight_var = NULL, B = 300
+      )
+      a_ci_lwr <- ci_res$a_lwr;        a_ci_upr <- ci_res$a_upr
+      growth_ci_lwr <- ci_res$growth_lwr; growth_ci_upr <- ci_res$growth_upr
+      boot_n_ok <- ci_res$n_ok
+    } else {
+      a_ci_lwr <- NA; a_ci_upr <- NA
+      growth_ci_lwr <- NA; growth_ci_upr <- NA
+      boot_n_ok <- NA
+    }
+    
+    plot_obj <- ggplot(my_c_df, aes(x = !!sym(cont_var), y = !!sym(dep_var_name))) +
+      geom_point(size = .5, alpha = .75, fill = 'black', stroke = 0) +
+      { if (fit_ok) geom_line(data = age_grid, aes(y = chapman_curve), color = "deepskyblue4", linewidth = .75) } +
+      scale_y_continuous(limits = c(-45, 60), expand = expansion(mult = c(0, 0))) +
+      xlim(0, 100) + # setting age limit for plot to 100y for better viz, even though there are a few outliers.  
+      labs(title = my_af_cat, x = "Age", y = expression(Delta~SOC~(Mg~ha^{-1}))) +
+      { if (!fit_ok) labs(title = paste0(my_af_cat, ' (', no_data_reason, ')')) } +
+      { if (fit_ok) annotate("label", x = 99, y = 55,
+          label = paste0("a = ", round(a_hat, 2), "\nb = ", round(b_hat, 4), "\nc = ", round(c_hat, 2),
+                         "\nRMSE = ", round(rmse, 2), "\nR\u00b2 = ", round(r_squared, 2)),
+          hjust = 1, vjust = 1, size = 2.5,
+          fill = alpha("white", 0.8), label.size = 0,
+          label.padding = unit(0.15, "lines")) } +
+      theme_minimal(base_size = 10)
+    
+    soc_plot_list[[my_audebert_reg]][[my_af_cat]] <- plot_obj
+    
+    soc_out_df <- soc_out_df %>% bind_rows(tibble(
+      ecoregion = my_audebert_reg,
+      af_cat = my_af_cat,
+      n = my_n,
+      asymptotic_max_a = a_hat,
+      a_ci_lwr = a_ci_lwr,
+      a_ci_upr = a_ci_upr,
+      growth_rate_b = b_hat,
+      curve_shape_c = c_hat,
+      age_max_growth = ageinfl,
+      age_90_pct = t90,
+      avg_growth_rate_to_90 = mai90,
+      growth_rate_ci_lwr = growth_ci_lwr,
+      growth_rate_ci_upr = growth_ci_upr,
+      boot_n_ok = boot_n_ok,
+      rmse = rmse,
+      mae = mae,
+      r_squared = r_squared,
+      no_data_reason = no_data_reason
+    ))
+  }
+}
+
+
+# print plots
+
+# full battery of plots
+for (my_audebert_reg in audebert_regs) {
+  combined_plot <- wrap_plots(soc_plot_list[[my_audebert_reg]], ncol = 2, axes = 'collect', axis_titles = 'collect') +
+    plot_annotation(title = my_audebert_reg)
+  suppressWarnings(print(combined_plot))
+}
+
+# panel plot with only "ALL" audebert regions
+soc_plot_list_all_reg <- list()
+for (my_af_cat in af_cats) {
+  reason <- soc_out_df |> filter(ecoregion == 'ALL', af_cat == my_af_cat) |> pull(no_data_reason)
+  reason_suffix <- if (length(reason) > 0 && !is.na(reason[1])) paste0(' (', reason[1], ')') else ''
+  base_title <- if (my_af_cat == 'ALL') 'All AF categories' else my_af_cat
+  soc_plot_list_all_reg[[my_af_cat]] <- soc_plot_list[['ALL']][[my_af_cat]] +
+    labs(title = paste0(base_title, reason_suffix))
+}
+soc_combined_plot_all_reg <- wrap_plots(soc_plot_list_all_reg, ncol = 2, axes = 'collect', axis_titles = 'collect')
+suppressWarnings(print(soc_combined_plot_all_reg))
+ggsave(here("output", "figures", "soc_delta_cr_fit_by_af_cat_all_reg_panel.png"), plot = soc_combined_plot_all_reg, width = 7, height = 5, dpi = 600)
+```
+
+
+SOC (delta) vs. age panel by ecoregion (all AF categories pooled), with delta-method 95% confidence bands.
+```{r soc-er-panel, fig.width = 7, fig.height = 7}
+# Panel: SOC delta vs age by ecoregion — single colour, 95% CI band on curve (delta method)
+# Reuses fit_cr_bands() defined in the AGC chunk above.
+
+desired_order_er_soc <- c("Tropical/subtropical wet", "Tropical/subtropical dry",
+                          "Temperate wet", "Temperate dry", "Boreal/polar", "ALL")
+
+soc_panel_list <- list()
+
+for (my_audebert_reg in desired_order_er_soc) {
+  my_data <- if (my_audebert_reg == "ALL") soc_df else
+    soc_df |> filter(ecoregion == my_audebert_reg)
+
+  bands       <- fit_cr_bands(my_data, dep_var = "c_t_ha_delta", weighted = FALSE)
+  scatter     <- my_data |> filter(!is.na(c_t_ha_delta), !is.na(age))
+  panel_title <- if (my_audebert_reg == "ALL") "All ecoregions" else my_audebert_reg
+
+  soc_panel_list[[my_audebert_reg]] <- ggplot(scatter, aes(x = age, y = c_t_ha_delta)) +
+    { if (!is.null(bands))
+        geom_ribbon(data = bands, aes(x = age, ymin = lwr, ymax = upr),
+                    inherit.aes = FALSE, fill = "deepskyblue4", alpha = 0.2) } +
+    geom_point(size = 0.85, alpha = 0.5, shape = 16, stroke = 0, color = "grey40") +
+    { if (!is.null(bands))
+        geom_line(data = bands, aes(x = age, y = fit),
+                  color = "deepskyblue4", linewidth = 0.85, inherit.aes = FALSE) } +
+    scale_y_continuous(limits = c(-45, 60), expand = expansion(mult = c(0, 0))) +
+    xlim(0, 100) +
+    labs(title = panel_title, x = "Age (years)", y = expression(Delta~SOC~(Mg~ha^{-1}))) +
+    theme_minimal(base_size = 9) +
+    theme(plot.title       = element_text(size = 8, face = "bold"),
+          axis.title       = element_text(size = 8),
+          panel.grid.minor = element_blank())
+}
+
+soc_er_panel <- wrap_plots(soc_panel_list, ncol = 2, axes = "collect", axis_titles = "collect")
+suppressWarnings(print(soc_er_panel))
+ggsave(here("output", "figures", "soc_delta_cr_fit_by_er_all_af_cat_panel.png"),
+       plot = soc_er_panel, width = 7, height = 7, dpi = 600, bg = "white")
+```
+
+
+Alternative AGC and SOC ecoregion panels with case-bootstrap (rather than delta-method) 95% confidence bands.
+```{r bootstrap-panels, fig.width = 7, fig.height = 7}
+set.seed(2094)
+# Case-bootstrap 95% CI panels — AGC and SOC
+# Kept separate from the delta-method chunks above so both versions are reproducible.
+#
+# Strategy: fit original data with full brute-force start to get reliable coefficients,
+# then refit B resamples using those coefficients as a warm start (no brute-force),
+# and take 2.5/97.5 percentiles of the curve envelope.
+# y_ref (0.95-quantile cap) is recomputed from each resample so the parameterisation
+# remains internally consistent.
+
+fit_cr_bands_boot <- function(my_df, dep_var, B = 500,
+                               age_seq   = seq(0, 100, by = 0.5),
+                               alpha_level = 0.05, weighted = TRUE) {
+  my_df <- my_df |> filter(!is.na(.data[[dep_var]]), !is.na(age))
+  if (nrow(my_df) < 15) return(NULL)
+  # Age-weighted to match the AGC table fits; SOC fits are unweighted
+  w <- if (weighted) my_df$age else rep(1, nrow(my_df))
+
+  t95_lower <- 5; t95_upper <- 80
+  cr_form   <- as.formula(paste0(
+    dep_var, " ~ (y_ref * plogis(alpha)) *",
+    " (1 - exp(-(-log(1 - 0.95^(1/c)) / t95) * age))^c"
+  ))
+
+  # ── Original fit (brute-force start for reliability) ──────────────────
+  y_ref       <- as.numeric(quantile(my_df[[dep_var]], 0.95, na.rm = TRUE))
+  c_start     <- 2
+  b_start     <- 1 / max(median(my_df$age, na.rm = TRUE), 1e-6)
+  t95_start   <- -log(1 - 0.95^(1 / c_start)) / max(b_start, 1e-8)
+  alpha_start <- qlogis(min(max(quantile(my_df[[dep_var]], 0.95) / y_ref, 1e-6), 0.99))
+
+  start_grid <- expand.grid(
+    alpha = seq(qlogis(0.005), qlogis(0.995), length.out = 15),
+    t95   = seq(t95_lower, t95_upper, length.out = 7),
+    c     = seq(1.5, 3, length.out = 5)
+  )
+  cr_nls2 <- try(nls2(cr_form, data = my_df, start = start_grid,
+    weights = w, algorithm = "brute-force",
+    control = nls.control(maxiter = 50, warnOnly = TRUE)), silent = TRUE)
+
+  best <- if (!inherits(cr_nls2, "try-error")) as.list(coef(cr_nls2)) else
+    list(alpha = alpha_start, t95 = t95_start, c = c_start)
+
+  cr_fit_orig <- try(nlsLM(cr_form, data = my_df, start = best,
+    weights = w,
+    lower = c(alpha = -20, t95 = t95_lower, c = 1.5),
+    upper = c(alpha =  20, t95 = t95_upper, c = 3),
+    control = nls.lm.control(maxiter = 500, ftol = 1e-10, ptol = 1e-10)),
+    silent = TRUE)
+
+  if (inherits(cr_fit_orig, "try-error")) return(NULL)
+  r_sq <- 1 - sum((my_df[[dep_var]] - predict(cr_fit_orig))^2) /
+              sum((my_df[[dep_var]] - mean(my_df[[dep_var]]))^2)
+  if (r_sq < 0) return(NULL)
+
+  warm_start  <- as.list(coef(cr_fit_orig))
+  y_ref_orig  <- as.numeric(quantile(my_df[[dep_var]], 0.95, na.rm = TRUE))
+
+  # ── Bootstrap loop ────────────────────────────────────────────────────
+  # y_ref is updated each iteration; formula looks it up from this environment
+  boot_preds <- matrix(NA_real_, nrow = B, ncol = length(age_seq))
+
+  for (b in seq_len(B)) {
+    resamp <- my_df[sample(nrow(my_df), nrow(my_df), replace = TRUE), ]
+    y_ref  <- as.numeric(quantile(resamp[[dep_var]], 0.95, na.rm = TRUE))
+
+    fit_b <- try(nlsLM(cr_form, data = resamp, start = warm_start,
+      weights = if (weighted) resamp$age else rep(1, nrow(resamp)),
+      lower = c(alpha = -20, t95 = t95_lower, c = 1.5),
+      upper = c(alpha =  20, t95 = t95_upper, c = 3),
+      control = nls.lm.control(maxiter = 200, ftol = 1e-7, ptol = 1e-7)),
+      silent = TRUE)
+
+    if (inherits(fit_b, "try-error")) next
+
+    co_b <- coef(fit_b)
+    a_b  <- y_ref * plogis(co_b[["alpha"]])
+    bv_b <- -log(1 - 0.95^(1 / co_b[["c"]])) / co_b[["t95"]]
+    boot_preds[b, ] <- a_b * (1 - exp(-bv_b * age_seq))^co_b[["c"]]
+  }
+
+  ok <- rowSums(is.na(boot_preds)) == 0
+  message(sprintf("  %d/%d bootstrap fits succeeded", sum(ok), B))
+  if (sum(ok) < 50) return(NULL)
+
+  # Central curve from original fit
+  y_ref   <- y_ref_orig
+  co_orig <- coef(cr_fit_orig)
+  a_orig  <- y_ref * plogis(co_orig[["alpha"]])
+  bv_orig <- -log(1 - 0.95^(1 / co_orig[["c"]])) / co_orig[["t95"]]
+  y_fit   <- a_orig * (1 - exp(-bv_orig * age_seq))^co_orig[["c"]]
+
+  rmse <- sqrt(mean((my_df[[dep_var]] - predict(cr_fit_orig))^2))
+
+  bp <- boot_preds[ok, , drop = FALSE]
+  list(
+    bands = tibble(
+      age = age_seq,
+      fit = y_fit,
+      lwr = apply(bp, 2, quantile, probs = alpha_level / 2),
+      upr = apply(bp, 2, quantile, probs = 1 - alpha_level / 2)
+    ),
+    stats = list(
+      n    = nrow(my_df),
+      a    = a_orig,
+      b    = bv_orig,
+      c    = co_orig[["c"]],
+      rmse = rmse,
+      r_sq = r_sq
+    )
+  )
+}
+
+desired_order_er <- c("Tropical/subtropical wet", "Tropical/subtropical dry",
+                      "Temperate wet", "Temperate dry", "Boreal/polar", "ALL")
+
+# ── AGC bootstrap panel ───────────────────────────────────────────────────
+message("Fitting AGC bootstrap CIs...")
+agc_panel_list_boot <- list()
+for (my_audebert_reg in desired_order_er) {
+  message(my_audebert_reg)
+  my_data <- if (my_audebert_reg == "ALL") agc_df else
+    agc_df |> filter(ecoregion == my_audebert_reg)
+
+  result      <- fit_cr_bands_boot(my_data, dep_var = "c_t_ha")
+  bands       <- result$bands
+  stats       <- result$stats
+  scatter     <- my_data |> filter(!is.na(c_t_ha), !is.na(age))
+  panel_title <- if (my_audebert_reg == "ALL") "All ecoregions" else my_audebert_reg
+
+  agc_panel_list_boot[[my_audebert_reg]] <- ggplot(scatter, aes(x = age, y = c_t_ha)) +
+    { if (!is.null(bands))
+        geom_ribbon(data = bands, aes(x = age, ymin = lwr, ymax = upr),
+                    inherit.aes = FALSE, fill = "deepskyblue4", alpha = 0.2) } +
+    geom_point(size = 0.85, alpha = 0.5, shape = 16, stroke = 0, color = "grey40") +
+    { if (!is.null(bands))
+        geom_line(data = bands, aes(x = age, y = fit),
+                  color = "deepskyblue4", linewidth = 0.85, inherit.aes = FALSE) } +
+    { if (!is.null(stats))
+        annotate("label", x = 99, y = 130,
+          label = paste0("n = ", stats$n,
+                         "\na = ", round(stats$a, 2),
+                         "\nb = ", round(stats$b, 4),
+                         "\nc = ", round(stats$c, 2),
+                         "\nRMSE = ", round(stats$rmse, 2),
+                         "\nR\u00b2 = ", round(stats$r_sq, 2)),
+          hjust = 1, vjust = 1, size = 2.5,
+          fill = alpha("white", 0.8), linewidth = 0,
+          label.padding = unit(0.15, "lines")) } +
+    scale_y_continuous(limits = c(0, 140), expand = expansion(mult = c(0, 0))) +
+    xlim(0, 100) +
+    labs(title = panel_title, x = "Age (years)", y = expression(AGC~(Mg~ha^{-1}))) +
+    theme_minimal(base_size = 9) +
+    theme(plot.title       = element_text(size = 8, face = "bold"),
+          axis.title       = element_text(size = 8),
+          panel.grid.minor = element_blank())
+}
+
+agc_er_panel_boot <- wrap_plots(agc_panel_list_boot, ncol = 2,
+                                 axes = "collect", axis_titles = "collect")
+suppressWarnings(print(agc_er_panel_boot))
+ggsave(here("output", "figures", "agc_cr_fit_by_er_all_af_cat_panel_boot.png"),
+       plot = agc_er_panel_boot, width = 7, height = 7, dpi = 600, bg = "white")
+
+# ── SOC bootstrap panel ───────────────────────────────────────────────────
+message("Fitting SOC bootstrap CIs...")
+soc_panel_list_boot <- list()
+for (my_audebert_reg in desired_order_er) {
+  message(my_audebert_reg)
+  my_data <- if (my_audebert_reg == "ALL") soc_df else
+    soc_df |> filter(ecoregion == my_audebert_reg)
+
+  result      <- fit_cr_bands_boot(my_data, dep_var = "c_t_ha_delta", weighted = FALSE)
+  bands       <- result$bands
+  stats       <- result$stats
+  scatter     <- my_data |> filter(!is.na(c_t_ha_delta), !is.na(age))
+  panel_title <- if (my_audebert_reg == "ALL") "All ecoregions" else my_audebert_reg
+
+  soc_panel_list_boot[[my_audebert_reg]] <- ggplot(scatter, aes(x = age, y = c_t_ha_delta)) +
+    { if (!is.null(bands))
+        geom_ribbon(data = bands, aes(x = age, ymin = lwr, ymax = upr),
+                    inherit.aes = FALSE, fill = "deepskyblue4", alpha = 0.2) } +
+    geom_point(size = 0.85, alpha = 0.5, shape = 16, stroke = 0, color = "grey40") +
+    { if (!is.null(bands))
+        geom_line(data = bands, aes(x = age, y = fit),
+                  color = "deepskyblue4", linewidth = 0.85, inherit.aes = FALSE) } +
+    { if (!is.null(stats))
+        annotate("label", x = 99, y = 55,
+          label = paste0("n = ", stats$n,
+                         "\na = ", round(stats$a, 2),
+                         "\nb = ", round(stats$b, 4),
+                         "\nc = ", round(stats$c, 2),
+                         "\nRMSE = ", round(stats$rmse, 2),
+                         "\nR\u00b2 = ", round(stats$r_sq, 2)),
+          hjust = 1, vjust = 1, size = 2.5,
+          fill = alpha("white", 0.8), linewidth = 0,
+          label.padding = unit(0.15, "lines")) } +
+    scale_y_continuous(limits = c(-45, 60), expand = expansion(mult = c(0, 0))) +
+    xlim(0, 100) +
+    labs(title = panel_title, x = "Age (years)", y = expression(Delta~SOC~(Mg~ha^{-1}))) +
+    theme_minimal(base_size = 9) +
+    theme(plot.title       = element_text(size = 8, face = "bold"),
+          axis.title       = element_text(size = 8),
+          panel.grid.minor = element_blank())
+}
+
+soc_er_panel_boot <- wrap_plots(soc_panel_list_boot, ncol = 2,
+                                 axes = "collect", axis_titles = "collect")
+suppressWarnings(print(soc_er_panel_boot))
+ggsave(here("output", "figures", "soc_delta_cr_fit_by_er_all_af_cat_panel_boot.png"),
+       plot = soc_er_panel_boot, width = 7, height = 7, dpi = 600, bg = "white")
+```
+
+
+Write the SOC (delta) C-R fit tables: all region x AF category combinations, and a filtered version with successful fits only, with the observed mean annual SOC change rate per partition from `soc_change_df` (helpers defined in the `agc-fit-tables` chunk).
+```{r soc-fit-tables}
+write_cr_tables(soc_out_df, soc_change_df,
+                curve_header = "Chapman-Richards curve fit (\u0394SOC vs. stand age)",
+                file_stem = "soc_cr_fit_table")
+```

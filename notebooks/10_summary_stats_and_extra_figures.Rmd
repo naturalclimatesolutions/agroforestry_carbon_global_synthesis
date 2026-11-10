@@ -1,0 +1,557 @@
+---
+title: "10 - Summary statistics for the text and supplementary figures"
+output: html_document
+---
+
+**Purpose.** Generates one-off numbers that are reported in the text of the
+paper (database size, plot counts, percentages, etc.), two supplementary
+tables, two figures, and the site-level data for the map figure, none of
+which are produced elsewhere in the pipeline:
+
+- the Chapman-Richards parameter illustration (`c-r_curve_example_fig.png`)
+- the agroforestry category x Audebert climate region matrix (`af_cat_aud_reg_matrix.png`)
+- site-level carbon CSVs used to draw the site map
+
+**Inputs.**
+
+- `data/groa_af/studies.csv`, `sites.csv`, `measurements.csv` (GROA-AF dataset)
+- `output/intermediate/s3_by_plot.xlsx` (notebook 01)
+- `output/intermediate/soc_data_out_c_t_ha_norm_30.xlsx` (notebook 02c)
+- `output/data/*_by_plot_and_age_w_covars.xlsx` (notebooks 03a/03b)
+- `output/data/*_by_plot_and_age_w_covars_drop_outliers.xlsx` (notebook 04)
+- `output/tables/agc_cr_fit_table_filtered.xlsx` (notebook 07)
+
+**Outputs.**
+
+- `output/tables/agc_cr_fit_table_filtered_w_trees_per_ha.xlsx`
+- `output/tables/bp_and_parkland_prior_cat_summary.xlsx`
+- `output/tables/sites_with_{agc,bgc,soc}[_change]_for_map.csv`
+- `output/figures/c-r_curve_example_fig.png`
+- `output/figures/af_cat_aud_reg_matrix.png`
+
+Each section below is independent once the setup chunk has been run.
+
+
+# Setup
+
+```{r setup, message = FALSE}
+library(here)
+library(tidyverse)
+library(openxlsx)
+library(ggrepel)
+
+# Single-category agroforestry codes used throughout the analysis. Plots
+# assigned to multiple categories (e.g. "AC, SA") are excluded where this
+# filter is applied.
+af_cats <- c('AC', 'BP', 'COP', 'FAL', 'FOD', 'MS', 'OTH_AF', 'PAR', 'RB',
+             'ROT', 'SA', 'SP', 'SPC', 'TMC', 'WL')
+
+read_groa <- function(table) read.csv(here("data", "groa_af", paste0(table, ".csv")),
+                                    na.strings = "", fileEncoding = "UTF-8-BOM",
+                                    colClasses = c(study_id = "character", site_id = "character", plot_id = "character"))
+s1 <- read_groa('studies')
+s2 <- read_groa('sites') |> rename(ecoregion = audebert_ecoregion_5class)
+s3 <- read_groa('measurements')
+
+read_int <- function(file) read.xlsx(here("output", "intermediate", file))
+read_data <- function(file) read.xlsx(here("output", "data", file))
+
+# Before outlier removal (notebooks 03a/03b)
+agc_w_covars <- read_data('agc_by_plot_and_age_w_covars.xlsx')
+bgc_w_covars <- read_data('bgc_by_plot_and_age_w_covars.xlsx')
+soc_w_covars <- read_data('soc_by_plot_and_age_w_covars.xlsx')
+
+# Final analysis datasets (notebook 04)
+agc_final <- read_data('agc_by_plot_and_age_w_covars_drop_outliers.xlsx')
+bgc_final <- read_data('bgc_by_plot_and_age_w_covars_drop_outliers.xlsx')
+soc_final <- read_data('soc_by_plot_and_age_w_covars_drop_outliers.xlsx')
+
+# Final datasets restricted to single, listed agroforestry categories
+agc_df <- agc_final |> filter(af_cat %in% af_cats)
+soc_df <- soc_final |> filter(af_cat %in% af_cats)
+```
+
+
+# Database and dataset sizes
+
+Unique plots are distinct study/site/plot combinations. The measurements table stores these as
+separate columns; the plot-and-age tables store them pre-combined as
+`ssp_id` ("study_id;site_id;plot_id"). Studies and sites are literature- and
+site-level, so a plot count doesn't apply.
+
+```{r database-row-counts}
+n_unique_plots_s3 <- s3 |> distinct(study_id, site_id, plot_id) |> nrow()
+
+pools <- list(
+  agc_by_plot_and_age_w_covars = agc_w_covars,
+  bgc_by_plot_and_age_w_covars = bgc_w_covars,
+  soc_by_plot_and_age_w_covars = soc_w_covars,
+  agc_by_plot_and_age_w_covars_drop_outliers = agc_final,
+  bgc_by_plot_and_age_w_covars_drop_outliers = bgc_final,
+  soc_by_plot_and_age_w_covars_drop_outliers = soc_final
+)
+
+pool_counts <- tibble(
+  metric = paste(names(pools), "rows"),
+  n = map_int(pools, nrow),
+  n_unique_plots = map_int(pools, \(d) n_distinct(d$ssp_id))
+)
+
+bind_rows(
+  tibble(
+    metric = c('sites rows', 'measurements rows', 'studies rows with included == 1'),
+    n = c(nrow(s2), nrow(s3), sum(s1$included == 1, na.rm = TRUE)),
+    n_unique_plots = c(NA, n_unique_plots_s3, NA)
+  ),
+  pool_counts[1:3, ],
+  pool_counts[1:3, ] |>
+    summarise(metric = 'sum of agc + bgc + soc w_covars rows',
+              across(c(n, n_unique_plots), sum)),
+  pool_counts[4:6, ],
+  pool_counts[4:6, ] |>
+    summarise(metric = 'sum of agc + bgc + soc w_covars_drop_outliers rows',
+              across(c(n, n_unique_plots), sum))
+)
+```
+
+
+# Plot counts by Audebert climate region
+
+Share of all plots (measurements table) falling in each ecoregion.
+
+```{r audebert-region-plot-counts}
+s3_plots <- read_int('s3_by_plot.xlsx')
+audebert <- s2 |> select(site_id, ecoregion)
+
+s3_plots |>
+  left_join(audebert |> select(site_id, ecoregion), by = 'site_id') |>
+  mutate(ecoregion = na_if(trimws(ecoregion), '')) |>
+  count(ecoregion) |>
+  mutate(pct = round(n / sum(n) * 100, 1)) |>
+  arrange(desc(n))
+```
+
+
+# Plot counts by agroforestry category (all pools combined)
+
+A plot can appear in more than one pool (and at more than one age). Each
+plot is assigned a single category, preferring the category recorded at a
+non-zero age.
+
+```{r comb-af-cat-plot-counts}
+bind_rows(agc_final, bgc_final, soc_final) |>
+  filter(af_cat %in% af_cats) |>
+  group_by(ssp_id) |>
+  summarise(
+    af_cat = {
+      non_zero_age_cats <- unique(af_cat[age != 0])
+      if (length(non_zero_age_cats) > 0) non_zero_age_cats[1] else unique(af_cat)[1]
+    },
+    .groups = "drop"
+  ) |>
+  count(af_cat, sort = TRUE) |>
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+
+# Tree density and AGC by agroforestry category
+
+Medians by category, plus a pooled row for the low-stature systems
+(fallow, fodder bank, coppice) and an overall row.
+
+```{r agc-af-cat-summary}
+summarise_density <- function(d) {
+  summarise(d,
+            n = n(),
+            trees_per_ha_median = median(trees_per_ha, na.rm = TRUE),
+            c_t_ha_median = median(c_t_ha, na.rm = TRUE))
+}
+
+bind_rows(
+  agc_df |> group_by(af_cat) |> summarise_density() |> arrange(desc(trees_per_ha_median)),
+  agc_df |> filter(af_cat %in% c("FAL", "FOD", "COP")) |> summarise_density() |>
+    mutate(af_cat = "FAL + FOD + COP"),
+  agc_df |> summarise_density() |> mutate(af_cat = "Overall")
+)
+```
+
+
+# Tree density added to the AGC Chapman-Richards fit table
+
+Adds mean and median tree density for each region x category row of the
+AGC fit table (notebook 07).
+
+```{r agc-biomass-table-tree-density}
+# Two header rows and line breaks in long header/cell text (07): read from the
+# second row and restore the plain labels ("(Sub)tropical" -> "Tropical/subtropical")
+read_cr_table <- function(file, sep.names = ".") {
+  d <- read.xlsx(file, startRow = 2, sep.names = " ")
+  unwrap <- function(x) {
+    x <- gsub("\\s*\\r?\\n\\s*", " ", gsub("/\\r?\\n", "/", x))
+    x <- sub("^All cats\\.$", "All AF categories", x)
+    sub("^Insuff\\. data$", "Insufficient data", sub("^\\(Sub\\)tropical", "Tropical/subtropical", x))
+  }
+  names(d) <- gsub(" ", sep.names, unwrap(names(d)), fixed = TRUE)
+  d[] <- lapply(d, \(x) if (is.character(x)) unwrap(x) else x)
+  d
+}
+agc_biomass_table <- read_cr_table(here("output", "tables", "agc_cr_fit_table_filtered.xlsx"))
+
+# Map each fit-table Region label to the ecoregion values it
+# aggregates over (NULL = no filter, i.e. all regions including NA)
+region_map <- list(
+  "Tropical/subtropical wet" = c("Tropical/subtropical wet"),
+  "Tropical/subtropical dry" = c("Tropical/subtropical dry"),
+  "Tropical/subtropical all" = c("Tropical/subtropical wet", "Tropical/subtropical dry"),
+  "Temperate wet"            = c("Temperate wet"),
+  "Temperate dry"            = c("Temperate dry"),
+  "Temperate all"            = c("Temperate wet", "Temperate dry"),
+  "Boreal/polar"             = c("Boreal/polar"),
+  "All ecoregions"           = NULL
+)
+
+# "All AF categories" rows aggregate over every category in agc_df
+subset_for_row <- function(region, af_cat_val) {
+  d <- agc_df
+  regs <- region_map[[region]]
+  if (!is.null(regs)) {
+    d <- d[d$ecoregion %in% regs & !is.na(d$ecoregion), ]
+  }
+  if (af_cat_val != "All AF categories") {
+    d <- d[d$af_cat == af_cat_val, ]
+  }
+  d
+}
+
+agc_biomass_table <- agc_biomass_table |>
+  rowwise() |>
+  mutate(
+    trees_per_ha        = mean(subset_for_row(Region, AF.category)$trees_per_ha, na.rm = TRUE),
+    trees_per_ha_median = median(subset_for_row(Region, AF.category)$trees_per_ha, na.rm = TRUE)
+  ) |>
+  ungroup() |>
+  rename(
+    'Tree density, mean (stems Ha\u207b\u00b9)'   = trees_per_ha,
+    'Tree density, median (stems Ha\u207b\u00b9)' = trees_per_ha_median
+  )
+
+write.xlsx(agc_biomass_table,
+           here("output", "tables", "agc_cr_fit_table_filtered_w_trees_per_ha.xlsx"),
+           overwrite = TRUE)
+```
+
+
+# Prior land use for boundary plantings and parklands
+
+For plots of a given category, tallies how many (and what %) list each
+prior land-use category. `prior_land_use` is a comma-separated string, so a plot
+with several prior categories counts toward each and percentages need not
+sum to 100.
+
+```{r prior-cat-summary-by-af-cat}
+summarize_prior_cats <- function(df, df_name, af_cat_val) {
+  sub_df <- df |> filter(af_cat == af_cat_val)
+  n_sub <- nrow(sub_df)
+
+  sub_df |>
+    mutate(prior_land_use = if_else(prior_land_use == "" | is.na(prior_land_use),
+                                "None listed", prior_land_use)) |>
+    separate_longer_delim(prior_land_use, delim = ", ") |>
+    count(prior_cat = prior_land_use, name = "n_plots") |>
+    mutate(df = df_name, pct_of_plots = round(100 * n_plots / n_sub, 1)) |>
+    select(df, prior_cat, n_plots, pct_of_plots) |>
+    arrange(desc(n_plots))
+}
+
+# One row per prior category, AGC and SOC side by side as "n (%)"
+build_prior_cat_table <- function(af_cat_val) {
+  bind_rows(
+    summarize_prior_cats(agc_df, "AGC", af_cat_val),
+    summarize_prior_cats(soc_df, "SOC", af_cat_val)
+  ) |>
+    mutate(label = paste0(n_plots, " (", pct_of_plots, "%)")) |>
+    select(df, prior_cat, label) |>
+    pivot_wider(names_from = df, values_from = label, values_fill = "0 (0%)") |>
+    rename(`Prior land use` = prior_cat) |>
+    arrange(desc(AGC))
+}
+
+bp_prior_cat_table       <- build_prior_cat_table("BP")
+parkland_prior_cat_table <- build_prior_cat_table("PAR")
+
+knitr::kable(bp_prior_cat_table, align = "lcc", caption = "BOUNDARY_PLANTING")
+knitr::kable(parkland_prior_cat_table, align = "lcc", caption = "PARKLAND")
+
+write.xlsx(
+  list(BOUNDARY_PLANTING = bp_prior_cat_table, PARKLAND = parkland_prior_cat_table),
+  here("output", "tables", "bp_and_parkland_prior_cat_summary.xlsx"),
+  overwrite = TRUE
+)
+```
+
+
+# SOC dataset characteristics
+
+## Grassland prior land use or control, by category
+
+```{r soc-gra-prior-by-af-cat}
+soc_gra <- soc_df |>
+  mutate(has_gra = str_detect(prior_land_use, "GRA") | str_detect(ctrl_cat, "GRA"))
+
+bind_rows(
+  soc_gra |> group_by(af_cat) |>
+    summarise(n = n(), pct_gra = mean(has_gra, na.rm = TRUE) * 100) |>
+    arrange(desc(pct_gra)),
+  soc_gra |>
+    summarise(af_cat = "Overall", n = n(), pct_gra = mean(has_gra, na.rm = TRUE) * 100)
+)
+```
+
+## Boundary planting / riparian buffer plots vs. all other categories
+
+Mean of each numeric covariate by group, and the most common levels of key
+categorical covariates among BP/RB plots.
+
+```{r soc-bp-rb-vs-other-covariates}
+soil_tex_cols <- soc_df |> select(starts_with("soil_tex_"), -soil_texture_class) |> names()
+loam_cols <- soil_tex_cols[str_detect(soil_tex_cols, "loam")]
+
+bp_rb_df <- soc_df |>
+  mutate(grp = ifelse(af_cat %in% c("BP", "RB"), "BP/RB", "Other")) |>
+  # NA in these one-hot soil texture columns means absence
+  mutate(across(all_of(soil_tex_cols), ~replace_na(.x, 0))) |>
+  mutate(soil_tex_any_loam = as.numeric(rowSums(across(all_of(loam_cols))) > 0))
+
+numeric_vars <- bp_rb_df |> select(where(is.numeric), -row_id) |> names()
+
+bp_rb_df |>
+  group_by(grp) |>
+  summarise(across(all_of(numeric_vars), ~mean(.x, na.rm = TRUE))) |>
+  pivot_longer(-grp, names_to = "variable", values_to = "mean") |>
+  pivot_wider(names_from = grp, values_from = mean) |>
+  mutate(diff = `BP/RB` - Other) |>
+  arrange(desc(abs(diff)))
+
+for (v in c("ipcc_reg", "ecoregion", "soil_texture_class", "country")) {
+  cat("\n---", v, "---\n")
+  print(
+    bp_rb_df |>
+      filter(grp == "BP/RB") |>
+      count(.data[[v]], sort = TRUE) |>
+      mutate(pct = round(100 * n / sum(n), 1)) |>
+      head(4)
+  )
+}
+```
+
+## Measurement depth
+
+```{r soc-depth-max-summary}
+soc_df |>
+  summarise(
+    min_depth_max    = min(depth_max, na.rm = TRUE),
+    median_depth_max = median(depth_max, na.rm = TRUE),
+    max_depth_max    = max(depth_max, na.rm = TRUE)
+  )
+```
+
+## Share of plots with a diachronic (repeated-measurement) design
+
+`soil_comparison` (from notebook 02c) classifies how each SOC comparison was
+built. `plot_change` means the same plot was resampled and compared to its
+own earlier reading (strict diachronic definition). `plot_change/site_ref`
+also resamples the same plot but compares it to a separate non-AF site
+reference (broader definition). All other values are control or
+chronosequence comparisons.
+
+`soil_comparison` isn't kept in the final SOC dataset, so it is pulled from the
+intermediate output, with the same `sc_flag == ''` filter used in notebook
+04a, and restricted to plots in the final dataset (all categories).
+
+```{r soc-diachronic-pct}
+soc_comp_lookup <- read_int('soc_data_out_c_t_ha_norm_30.xlsx') |>
+  filter(sc_flag == '') |>
+  distinct(ssp_id, soil_comparison)
+
+final_soc_plots <- unique(soc_final$ssp_id)
+
+# Every final plot should have a soil_comparison classification
+stopifnot(all(final_soc_plots %in% soc_comp_lookup$ssp_id))
+
+matched_soc_comp <- soc_comp_lookup |> filter(ssp_id %in% final_soc_plots)
+
+tibble(
+  definition = c(
+    'plot_change only (plot resampled, compared to its own earlier reading)',
+    'plot_change + plot_change/site_ref (plot resampled, compared to own reading or a site reference)'
+  ),
+  n_diachronic_plots = c(
+    sum(matched_soc_comp$soil_comparison %in% 'plot_change'),
+    sum(matched_soc_comp$soil_comparison %in% c('plot_change', 'plot_change/site_ref'))
+  ),
+  n_total_plots = nrow(matched_soc_comp),
+  pct_diachronic = round(100 * n_diachronic_plots / n_total_plots, 1)
+)
+```
+
+
+# Figure: Chapman-Richards parameter illustration
+
+Illustrates how each parameter of $y = a(1 - e^{-bt})^c$ shapes the curve,
+varying one parameter at a time around a = 10, b = 0.5, c = 2.
+
+```{r cr-curve-example-fig, fig.width = 7, fig.height = 4}
+cr_fun <- function(t, a, b, c) a * (1 - exp(-b * t))^c
+
+t_vals <- seq(0, 10, length.out = 400)
+
+vary_param <- function(values, param_name, panel_label) {
+  map_dfr(values, function(v) {
+    args <- list(a = 10, b = 0.5, c = 2)
+    args[[param_name]] <- v
+    tibble(t = t_vals,
+           y = do.call(cr_fun, c(list(t = t_vals), args)),
+           param = paste0(param_name, " = ", v),
+           panel = panel_label)
+  })
+}
+
+df_plot <- bind_rows(
+  vary_param(c(5, 10, 15),      "a", "Varying a \n (upper asymptote)"),
+  vary_param(c(0.25, 0.5, 1.0), "b", "Varying b \n (growth rate)"),
+  vary_param(c(1, 2, 3),        "c", "Varying c \n (curve shape)")
+)
+
+# One label per curve, placed at the sampled point nearest t = 2.5 / 5 / 7.5
+t_targets <- c(2.5, 5, 7.5)
+
+df_labels <- df_plot |>
+  group_by(panel) |>
+  group_modify(~ tibble(param = unique(.x$param),
+                        t_target = t_targets[seq_along(unique(.x$param))])) |>
+  left_join(df_plot, by = c("panel", "param")) |>
+  group_by(panel, param, t_target) |>
+  slice_min(abs(t - t_target), n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(panel, param, t_lab = t, y_lab = y, label = param)
+
+ggplot(df_plot, aes(x = t, y = y, color = param)) +
+  geom_line(linewidth = 1) +
+  geom_label_repel(
+    data = df_labels,
+    aes(x = t_lab, y = y_lab, label = label, color = param),
+    inherit.aes = FALSE,
+    size = 3, label.size = 0.25, label.r = unit(0.1, "lines"),
+    label.padding = unit(0.15, "lines"), fill = "white", alpha = 0.9,
+    box.padding = 0, point.padding = 0.1, min.segment.length = 0,
+    segment.alpha = 0.5, seed = 123
+  ) +
+  facet_wrap(~ panel, scales = "free_y") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none", panel.grid.minor = element_blank()) +
+  labs(x = "Time", y = "Carbon stock",
+       title = "Effects of a, b, and c on the Chapman-Richards curve")
+
+ggsave(here("output", "figures", "c-r_curve_example_fig.png"),
+       width = 7, height = 4, dpi = 600)
+```
+
+
+# Figure: agroforestry category x Audebert climate region matrix
+
+Number (and row %) of plots in each category x climate region combination,
+based on all plots in the measurements table (before carbon-pool-specific filtering). Plots with
+multiple categories contribute one row per category. Regions with 30 or
+fewer plots are omitted.
+
+```{r af-cat-aud-reg-matrix, fig.width = 9, fig.height = 5}
+# Categories shown in the figure (FOD, OTH_AF, PAR, RB and ROT are not shown)
+matrix_af_cats_plot <- c('AC', 'BP', 'COP', 'FAL', 'MS', 'SA', 'SP', 'SPC', 'TMC', 'WL')
+
+# Ecoregions from the sites table (includes nearest-zone assignments)
+site_regions <- audebert |>
+  select(site_id, ecoregion) |>
+  mutate(across(everything(), as.character),
+         ecoregion = na_if(trimws(ecoregion), ''))
+
+af_cat_reg_df <- s3_plots |>
+  left_join(site_regions, by = "site_id") |>
+  separate_longer_delim(af_cat, delim = ', ') |>
+  # Unassigned plots would inflate the n labels but are dropped from the cells
+  filter(af_cat %in% matrix_af_cats_plot, !is.na(ecoregion))
+
+reg_order <- af_cat_reg_df |>
+  count(ecoregion, name = "reg_n") |>
+  arrange(desc(reg_n)) |>
+  mutate(reg_lbl = paste0(ecoregion, '\n(n = ', reg_n, ')')) |>
+  filter(reg_n > 30)
+
+af_cat_reg_df <- af_cat_reg_df |>
+  filter(ecoregion %in% reg_order$ecoregion)
+
+cat_order <- af_cat_reg_df |>
+  count(af_cat, name = "af_cat_n") |>
+  arrange(af_cat_n) |>
+  mutate(af_cat_lbl = paste0(af_cat, '\n(n = ', af_cat_n, ')'))
+
+af_cat_reg_df |>
+  count(af_cat, ecoregion) |>
+  na.omit() |>
+  group_by(af_cat) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  ungroup() |>
+  left_join(cat_order, by = "af_cat") |>
+  left_join(reg_order, by = "ecoregion") |>
+  mutate(reg_lbl    = factor(reg_lbl, levels = reg_order$reg_lbl),
+         af_cat_lbl = factor(af_cat_lbl, levels = cat_order$af_cat_lbl)) |>
+  ggplot(aes(y = af_cat_lbl, x = reg_lbl, fill = pct)) +
+  geom_tile() +
+  geom_label(aes(label = paste0(n, ' (', round(pct, 1), '%)')),
+             size = 3.5, fill = "white", alpha = 0.6, label.size = 0) +
+  scale_x_discrete(expand = expansion(mult = c(0, 0))) +
+  scale_y_discrete(expand = expansion(mult = c(0, 0))) +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(face = "bold"),
+        axis.text.y = element_text(face = "bold"),
+        panel.grid = element_blank())
+
+ggsave(here("output", "figures", "af_cat_aud_reg_matrix.png"), height = 5, width = 9)
+```
+
+
+# Site-level carbon data for the site map
+
+Mean carbon stock (plots aged 5 years or more) and mean annual carbon change
+per site, joined to site coordinates and area. One CSV per pool and metric.
+
+```{r map-site-csvs}
+site_data <- s2 |>
+  transmute(site_id,
+            lat_min = bbox_lat_min, lat_ctr = lat, lat_max = bbox_lat_max,
+            lon_min = bbox_lon_min, lon_ctr = lon, lon_max = bbox_lon_max,
+            area_m_sq = area_ha * 1e4, area_ha) |>
+  drop_na()
+
+site_means <- function(df, value_col, out_name, min_age = NULL) {
+  if (!is.null(min_age)) df <- df |> filter(age >= min_age)
+  df |>
+    mutate(site_id = str_split(ssp_id, ";", simplify = TRUE)[, 2]) |>
+    group_by(site_id) |>
+    summarise("{out_name}" := mean(.data[[value_col]], na.rm = TRUE)) |>
+    left_join(site_data, by = "site_id") |>
+    na.omit()
+}
+
+for (pool in c("agc", "bgc", "soc")) {
+  stock  <- get(paste0(pool, "_final"))
+  change <- read_data(paste0(pool, "_change_by_plot_and_age_w_covars_drop_outliers.xlsx"))
+
+  write.csv(site_means(stock, "c_t_ha", pool, min_age = 5),
+            here("output", "tables", paste0("sites_with_", pool, "_for_map.csv")))
+  write.csv(site_means(change, "c_t_ha_yr", paste0(pool, "_change")),
+            here("output", "tables", paste0("sites_with_", pool, "_change_for_map.csv")))
+}
+```

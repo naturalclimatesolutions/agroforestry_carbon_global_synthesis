@@ -1,0 +1,588 @@
+---
+title: "08 - Compare GROA-AF carbon estimates to IPCC Tier 1 defaults"
+output: html_document
+---
+
+**Purpose.** Compares the Chapman-Richards fit results from notebook 07 (aboveground carbon stock at maturity and growth rate, by climate region x agroforestry category) against the IPCC 2019 Refinement Tier 1 default values for agroforestry systems (Vol. 4, Ch. 5, Table 5.1). The two sources are joined on climate region and agroforestry category, percent differences are calculated, and a two-panel comparison figure is produced.
+
+**Inputs.**
+
+- `output/tables/agc_cr_fit_table_filtered.xlsx` and `soc_cr_fit_table_filtered.xlsx` (from `07_chapman_richards_fits.Rmd`)
+- IPCC Table 5.1 default values, hardcoded below
+
+**Outputs.**
+
+- `output/tables/groa_ipcc_df.csv`: joined GROA-AF / IPCC table with percent differences
+- `output/figures/groa_vs_ipcc_c_stock_growth_panel.png`: panel figure (AGC stock at maturity and accumulation rate)
+- `output/figures/agc_rate_comparison_by_method.png`: AGC accumulation rate per region x category from the C-R curve, the observed plot-level rates, and IPCC Tier 1
+- `output/figures/soc_delta_rate_comparison_by_method.png`: the same for ΔSOC (C-R curve vs. observed; no IPCC agroforestry SOC defaults)
+
+```{r setup}
+library(here)
+library(tidyverse)
+library(openxlsx)
+library(skimr)
+library(ggpmisc)
+library(patchwork)
+library(forcats)
+library(broom)
+library(emmeans)
+```
+
+IPCC Tier 1 default AGC stocks and accumulation rates for agroforestry systems.
+```{r ipcc-data}
+# Source: IPCC (2019) 2019 Refinement to the 2006 IPCC Guidelines for National
+# Greenhouse Gas Inventories, Vol. 4, Ch. 5 (Cropland), Tables 5.1 and 5.3
+# (https://www.ipcc-nggip.iges.or.jp/public/2019rf/pdf/4_Volume4/19R_V4_Ch05_Cropland.pdf).
+# c_t_ha = C stock at maturity (t C/ha); c_t_ha_yr = C accumulation rate (t C/ha/yr).
+# The *_95_ci columns are the 95% CI expressed as +/- % of the mean (e.g. 52 = +/-52%).
+# af_cat maps each IPCC system onto the matching GROA-AF agroforestry category code.
+
+ipcc_df <- tribble(
+  ~reg,         ~af_system,            ~af_cat, ~n, ~c_t_ha, ~c_t_ha_95_ci, ~c_t_ha_yr, ~c_t_ha_yr_95_ci,
+  
+  # tropical
+  "Tropical/subtropical",   "Fallow",            "FAL",        69, 22.1,  52,  4.42, 15,
+  "Tropical/subtropical",   "Hedgerow",           "BP",          3,  9.4, 59,    0.47, 31,
+  "Tropical/subtropical",   "Alley cropping",     "AC",         90, 47.4, 52,    2.37, 13,
+  "Tropical/subtropical",   "Multistrata",        "MS",         51, 65.0, 54,    3.25, 21,
+  "Tropical/subtropical",   "Parkland",           "PAR",         7, 11.8, 76,    0.59, 58,
+  "Tropical/subtropical",   "Shaded perennial",   "SPC",        28, 48.0, 55,    2.40, 24,
+  "Tropical/subtropical",   "Silvoarable",         "SA",         22, 72.2,60,   3.61, 33,
+  "Tropical/subtropical",   "Silvopasture",        "SP",         18, 58.2,61,     2.91, 63,
+  
+  # temperate
+  "Temperate",  "Hedgerow",           "BP",         12, 26.1, 59,     0.87, 49,
+  "Temperate",  "Silvoarable",         "SA",         14, 27.3, 62,     0.91, 52,
+  "Temperate",  "Silvopasture",        "SP",         10, 69.9, 61,     2.33, 52,
+  # Coppice: IPCC gives no sample size
+  "Temperate",  "Coppice",        "COP",         NA, 12.69, 40,     3.2, 40
+)
+```
+
+
+Load the GROA-AF Chapman-Richards fit results from notebook 07 and harmonize region and category names with the IPCC table.
+```{r load-groa}
+af_cat_labels <- c('AC' = "Alley cropping", 
+                   'BP' = 'Boundary planting', 
+                   'COP' = 'Coppice', 
+                   'FAL' = 'Fallows', 
+                   'FOD' = 'Fodder bank',
+                   'MS' = 'Multistrata', 
+                   'OTH_AF' = 'Other Agroforestry',
+                   'PAR' = 'Parklands', 
+                   'RB' = 'Riparian Buffer', 
+                   'ROT' = 'Rotational', 
+                   'SA' = 'Silvoarable', 
+                   'SP' = 'Silvopasture', 
+                   'SPC' = 'Shaded perennial',
+                   'TMC' = 'Tree monocrop', 
+                   'WL' = 'Woodlot')
+
+# C-R fit tables (07) have two header rows and line breaks in long header and
+# cell text, plus short labels "(Sub)tropical", "All cats." and
+# "Insuff. data"; read from
+# the second row and restore the plain labels
+read_cr_table <- function(file, sep.names = ".") {
+  d <- read.xlsx(file, startRow = 2, sep.names = " ")
+  unwrap <- function(x) {
+    x <- gsub("\\s*\\r?\\n\\s*", " ", gsub("/\\r?\\n", "/", x))
+    x <- sub("^All cats\\.$", "All AF categories", x)
+    sub("^Insuff\\. data$", "Insufficient data", sub("^\\(Sub\\)tropical", "Tropical/subtropical", x))
+  }
+  names(d) <- gsub(" ", sep.names, unwrap(names(d)), fixed = TRUE)
+  d[] <- lapply(d, \(x) if (is.character(x)) unwrap(x) else x)
+  d
+}
+
+groa_df <- read_cr_table(here("output", "tables", "agc_cr_fit_table_filtered.xlsx")) %>%
+  select(reg_full = Region,
+         af_cat = `AF.category`,
+         "GROA N" = n,
+         "GROA C at maturity" = `a.(Stock.at.maturity,.Mg.C.ha-1)`,
+         "GROA C at maturity CI lower" = `a.95%.CI.lower`,
+         "GROA C at maturity CI upper" = `a.95%.CI.upper`,
+         "GROA C growth rate" = `Growth.rate.(Mg.C.ha-1.yr-1)`,
+         "GROA C growth rate CI lower" = `Growth.rate.95%.CI.lower`,
+         "GROA C growth rate CI upper" = `Growth.rate.95%.CI.upper`) %>%
+  filter(reg_full != "All ecoregions",
+         af_cat != "All AF categories") %>%
+  mutate(groa_label = ifelse(grepl("wet", reg_full), "Our data (wet)",
+                          ifelse(grepl("dry", reg_full), "Our data (dry)", "Our data (wet & dry)"))) %>%
+  mutate(reg = reg_full %>%
+           str_replace_all(" all$", "") %>%
+           str_replace_all("wet", "") %>%
+           str_replace_all("dry", "") %>%
+           trimws()) %>%
+  mutate("GROA agroforestry category" = af_cat_labels[af_cat])
+```
+
+
+Join GROA-AF and IPCC values and compute percent differences relative to IPCC.
+```{r join}
+comb_df <- groa_df %>% 
+  left_join(ipcc_df %>%
+              rename("IPCC N" = n,
+                     "IPCC C at maturity" = c_t_ha,
+                     "IPCC C at maturity CI pct" = c_t_ha_95_ci,
+                     "IPCC C growth rate" = c_t_ha_yr,
+                     "IPCC C growth rate CI pct" = c_t_ha_yr_95_ci,
+                     "IPCC agroforestry system" = af_system) %>%
+              mutate(ipcc_label = "IPCC (wet & dry)"),
+            by = join_by(af_cat, reg)) %>%
+  rename("Climate region" = reg) %>%
+  mutate(
+    "Pct change C at maturity"  = (`GROA C at maturity`  - `IPCC C at maturity`)  / `IPCC C at maturity`  * 100,
+    "Pct change C growth rate"  = (`GROA C growth rate`  - `IPCC C growth rate`)   / `IPCC C growth rate`  * 100
+  )
+
+write.csv(comb_df, here("output", "tables", "groa_ipcc_df.csv"))
+```
+
+
+Prepare plot data
+
+Builds a shared numeric y-position per (climate_region, agroforestry category),
+ordered by mean GROA C at maturity (highest at bottom), plus small
+fixed vertical offsets for wet vs. dry sub-rows. These are reused by both the
+stock-at-maturity and growth-rate panels so their y-axes stay aligned.
+
+"Our data (wet & dry)" rows are dropped except for Boreal/polar, which has no
+wet/dry split and is the only region where that label is native (the
+"X all" aggregate rows for Tropical/subtropical and Temperate are otherwise
+redundant with their wet/dry rows).
+```{r plot-data}
+# ---------------------------
+# Drop redundant "wet & dry" rows, except Boreal/polar (native, no wet/dry split)
+# ---------------------------
+groa_filtered <- comb_df %>%
+  filter(`Climate region` == "Boreal/polar" | groa_label != "Our data (wet & dry)") %>%
+  mutate(climate_region = factor(
+    `Climate region`,
+    levels = c("Tropical/subtropical", "Temperate", "Boreal/polar")
+  ))
+
+# ---------------------------
+# Rank categories within each region by mean GROA C at maturity.
+# Globally-unique sequential y_pos (not reset per region) avoids tick-label
+# collisions later, since facet_grid(scales = "free_y") shows only the
+# breaks/labels that fall within each panel's own y-range.
+# ---------------------------
+groa_region_means <- groa_filtered %>%
+  group_by(climate_region, agro_cat = `GROA agroforestry category`) %>%
+  summarise(mean_groa_c = mean(`GROA C at maturity`, na.rm = TRUE), .groups = "drop")
+
+y_pos_lookup <- groa_region_means %>%
+  arrange(climate_region, desc(mean_groa_c)) %>%
+  mutate(y_pos = row_number())
+
+# Alternating white / very-light-grey bands, one per agroforestry category,
+# drawn in place of horizontal gridlines to visually separate categories.
+# Stripe alternation restarts within each climate_region facet (rather than
+# using the global y_pos), and counts down from the top row (largest y_pos
+# in the facet, since higher y_pos plots higher on the axis) so the topmost
+# row in every facet is always white -- regardless of how many categories
+# that facet has (odd or even).
+band_df <- y_pos_lookup %>%
+  group_by(climate_region) %>%
+  mutate(stripe = if_else((n() - row_number()) %% 2 == 0, "white", "grey")) %>%
+  ungroup()
+
+# ---------------------------
+# Shared offsets: wet below center, dry above center, wet&dry (Boreal) centered
+# ---------------------------
+wet_dry_offset   <- 0.26   # slightly wider gap so the IPCC "n=" label fits between wet/dry bars
+ipcc_half_height <- 0.42   # fixed regardless of whether 1 or 2 GROA sub-rows exist
+
+groa_plot_base <- groa_filtered %>%
+  left_join(y_pos_lookup, by = c("climate_region", "GROA agroforestry category" = "agro_cat")) %>%
+  mutate(
+    agro_cat = `GROA agroforestry category`,
+    y_offset = case_when(
+      groa_label == "Our data (wet)" ~ -wet_dry_offset,
+      groa_label == "Our data (dry)" ~  wet_dry_offset,
+      TRUE                           ~  0
+    ),
+    y = y_pos + y_offset
+  )
+
+groa_maturity_df <- groa_plot_base %>%
+  transmute(climate_region, agro_cat, label = groa_label, n = `GROA N`, y,
+            mean_val = `GROA C at maturity`,
+            ci_lower = `GROA C at maturity CI lower`,
+            ci_upper = `GROA C at maturity CI upper`) %>%
+  drop_na(mean_val)
+
+groa_growth_df <- groa_plot_base %>%
+  transmute(climate_region, agro_cat, label = groa_label, n = `GROA N`, y,
+            mean_val = `GROA C growth rate`,
+            ci_lower = `GROA C growth rate CI lower`,
+            ci_upper = `GROA C growth rate CI upper`) %>%
+  drop_na(mean_val)
+
+# Vertical span (per category) for the IPCC bar. Fixed height regardless of
+# whether 1 (single label) or 2 (wet+dry) GROA sub-rows exist for that
+# category — varying the height by row count looked inconsistent/confusing.
+offset_span <- y_pos_lookup %>%
+  transmute(climate_region, agro_cat, y_pos,
+            y_bottom = y_pos - ipcc_half_height,
+            y_top    = y_pos + ipcc_half_height)
+
+# IPCC CI is reported as a symmetric percent of the mean (e.g. 52 = ±52%);
+# convert to absolute lower/upper bounds for the CI band.
+ipcc_maturity_df <- comb_df %>%
+  distinct(`Climate region`, `GROA agroforestry category`, `IPCC C at maturity`,
+           `IPCC C at maturity CI pct`, `IPCC N`) %>%
+  drop_na(`IPCC C at maturity`) %>%
+  transmute(
+    climate_region = factor(`Climate region`, levels = c("Tropical/subtropical", "Temperate", "Boreal/polar")),
+    agro_cat = `GROA agroforestry category`,
+    label    = "IPCC",
+    n        = `IPCC N`,
+    ipcc_val = `IPCC C at maturity`,
+    ci_pct   = `IPCC C at maturity CI pct`,
+    ci_lower = ipcc_val * (1 - ci_pct / 100),
+    ci_upper = ipcc_val * (1 + ci_pct / 100)
+  ) %>%
+  inner_join(offset_span, by = c("climate_region", "agro_cat"))
+
+ipcc_growth_df <- comb_df %>%
+  distinct(`Climate region`, `GROA agroforestry category`, `IPCC C growth rate`,
+           `IPCC C growth rate CI pct`, `IPCC N`) %>%
+  drop_na(`IPCC C growth rate`) %>%
+  transmute(
+    climate_region = factor(`Climate region`, levels = c("Tropical/subtropical", "Temperate", "Boreal/polar")),
+    agro_cat = `GROA agroforestry category`,
+    label    = "IPCC",
+    n        = `IPCC N`,
+    ipcc_val = `IPCC C growth rate`,
+    ci_pct   = `IPCC C growth rate CI pct`,
+    ci_lower = ipcc_val * (1 - ci_pct / 100),
+    ci_upper = ipcc_val * (1 + ci_pct / 100)
+  ) %>%
+  inner_join(offset_span, by = c("climate_region", "agro_cat"))
+```
+
+
+Panel plot: C stock at maturity and C growth rate
+```{r panel-plot, fig.width=9, fig.height=5}
+color_vals <- c("Our data (wet)" = "#009E73", "Our data (dry)" = "#D55E00",
+                 "Our data (wet & dry)" = "#0072B2", "IPCC" = "black")
+label_order <- c("Our data (wet)", "Our data (dry)", "Our data (wet & dry)", "IPCC")
+region_labeller <- labeller(climate_region = function(x) gsub("/", "/\n", x))
+
+# Separate greys: one for the IPCC CI band + its legend glyph (darker, for
+# visibility against the data), one for the ecozone strip label boxes
+# (lighter, so it doesn't compete visually with the plotted data). Also grab
+# theme_bw()'s panel border colour/width so the ecozone boxes get an outline
+# that matches the plot panel border exactly.
+ipcc_ci_grey       <- "grey65"
+ecozone_grey       <- "grey90"
+panel_border_color <- theme_bw()$panel.border$colour
+panel_border_width <- theme_bw()$line$linewidth
+
+# No expansion needed: each band's own half-height (0.5) already defines the
+# exact per-facet range, so every category band ends up the same width with
+# no extra white space above/below.
+y_scale_maturity <- scale_y_continuous(
+  breaks = y_pos_lookup$y_pos, labels = y_pos_lookup$agro_cat,
+  expand = expansion(add = c(0, 0))
+)
+y_scale_growth <- scale_y_continuous(
+  breaks = y_pos_lookup$y_pos, labels = y_pos_lookup$agro_cat,
+  expand = expansion(add = c(0, 0))
+)
+
+# Small gap between the CI bar's right edge and its "n = " label, sized as a
+# fraction of each panel's own data range so it looks right regardless of
+# the panel's units
+pad_maturity <- diff(range(c(groa_maturity_df$mean_val, groa_maturity_df$ci_upper,
+                              ipcc_maturity_df$ipcc_val), na.rm = TRUE)) * 0.035
+
+# Explicit x-axis breaks, reused both for the axis itself and for the
+# manually-drawn vertical gridlines below (band rects sit on top of the
+# usual theme-drawn grid, so gridlines are instead added as their own
+# layer, positioned above the bands but below the data)
+maturity_range <- range(c(groa_maturity_df$mean_val, groa_maturity_df$ci_upper,
+                           ipcc_maturity_df$ipcc_val, ipcc_maturity_df$ci_upper), na.rm = TRUE)
+maturity_x_breaks <- scales::breaks_width(25)(maturity_range)
+
+growth_range <- range(c(groa_growth_df$mean_val, groa_growth_df$ci_upper,
+                         ipcc_growth_df$ipcc_val, ipcc_growth_df$ci_upper), na.rm = TRUE)
+growth_x_breaks <- scales::extended_breaks()(growth_range)
+
+# theme_bw()'s default gridline colour (#EBEBEB) is nearly indistinguishable
+# from the light-grey category bands, so both are adjusted here: a slightly
+# darker gridline colour, and a lighter band fill, so the lines stay visible
+# over both the white and grey bands
+gridline_color  <- "grey80"
+band_fill_grey  <- "grey94"
+
+# Custom legend glyph for "IPCC": a vertical black bar over a grey CI-band
+# swatch, so the legend key visually matches the plotted IPCC element. The
+# grey swatch is drawn as a thick round-capped segment (same technique and
+# linewidth as the actual GROA/IPCC bars) so its pill shape/height matches
+# the other legend keys exactly, rather than a rect that looked mismatched.
+pt_scale <- 72.27 / 25.4  # ggplot2's internal mm-to-pt conversion (.pt)
+
+draw_key_ipcc <- function(data, params, size) {
+  grid::grobTree(
+    grid::segmentsGrob(
+      x0 = 0.06, x1 = 0.94, y0 = 0.5, y1 = 0.5,
+      gp = grid::gpar(col = ipcc_ci_grey, lwd = 3.5 * pt_scale, lineend = "round")
+    ),
+    grid::segmentsGrob(
+      x0 = 0.5, x1 = 0.5, y0 = 0.05, y1 = 0.95,
+      gp = grid::gpar(col = data$colour %||% "black", lwd = 1.3 * pt_scale, lineend = "round")
+    )
+  )
+}
+
+# p_maturity
+p_maturity <- ggplot() +
+  # Alternating background bands (replace horizontal gridlines) — drawn
+  # first so everything else sits on top
+  geom_rect(
+    data = band_df,
+    aes(ymin = y_pos - 0.5, ymax = y_pos + 0.5, xmin = -Inf, xmax = Inf, fill = stripe),
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  scale_fill_manual(values = c(white = "white", grey = band_fill_grey)) +
+  # Vertical gridlines only, drawn above the bands but below the data
+  geom_vline(xintercept = maturity_x_breaks, color = gridline_color, linewidth = 0.5) +
+  # IPCC 95% CI band ('ci_pct' % of the mean): light grey, rounded ends, behind the IPCC mean line and GROA bars
+  geom_segment(
+    data = ipcc_maturity_df,
+    aes(x = ci_lower, xend = ci_upper, y = y_pos, yend = y_pos),
+    color = ipcc_ci_grey, lineend = "round", linewidth = 3.5
+  ) +
+  geom_segment(
+    data = ipcc_maturity_df,
+    aes(x = ipcc_val, xend = ipcc_val, y = y_bottom, yend = y_top, color = label),
+    lineend = "butt", linewidth = 1.3, key_glyph = draw_key_ipcc
+  ) +
+  geom_segment(
+    data = groa_maturity_df %>% filter(!is.na(ci_lower)),
+    aes(x = ci_lower, xend = ci_upper, y = y, yend = y, color = label),
+    lineend = "round", linewidth = 3.5, alpha = 0.85
+  ) +
+  geom_point(
+    data = groa_maturity_df,
+    aes(x = mean_val, y = y, color = label),
+    size = 1.6, shape = 21, fill = "white", stroke = 0
+  ) +
+  geom_text(
+    data = groa_maturity_df,
+    aes(x = if_else(is.na(ci_upper), mean_val, ci_upper) + pad_maturity,
+        y = y, label = paste0("n = ", n), color = label),
+    hjust = 0, size = 2.5, show.legend = FALSE
+  ) +
+  # IPCC "n=" sits at the category's center y_pos, just right of the CI
+  # band's right edge (consistent with how the GROA labels are placed)
+  geom_text(
+    data = ipcc_maturity_df,
+    aes(x = ci_upper + pad_maturity, y = y_pos, label = paste0("n = ", replace_na(as.character(n), "unknown")), color = label),
+    hjust = 0, vjust = 0.5, size = 2.3, show.legend = FALSE
+  ) +
+  facet_grid(climate_region ~ ., scales = "free_y", space = "free_y", labeller = region_labeller) +
+  scale_x_continuous(breaks = maturity_x_breaks, limits = c(0, NA),
+                     expand = expansion(mult = c(0, 0.1))) +
+  y_scale_maturity +
+  scale_color_manual(values = color_vals, breaks = label_order) +
+  guides(color = guide_legend(title = NULL)) +
+  labs(x = expression(AGC~stock~at~maturity~(Mg~ha^{-1})), y = "Agroforestry category") +
+  theme_bw() +
+  theme(
+    strip.text.y      = element_blank(),
+    strip.background  = element_blank(),
+    panel.spacing.y   = unit(0.6, "lines"),
+    panel.grid        = element_blank(),
+    legend.position   = "bottom",
+    legend.text       = element_text(size = 11),
+    legend.key.spacing.x = unit(12, "pt"),
+    axis.title.y      = element_text(margin = margin(r = 10))
+  )
+
+# p_growth
+p_growth <- ggplot() +
+  # Alternating background bands (replace horizontal gridlines) — drawn
+  # first so everything else sits on top
+  geom_rect(
+    data = band_df,
+    aes(ymin = y_pos - 0.5, ymax = y_pos + 0.5, xmin = -Inf, xmax = Inf, fill = stripe),
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  scale_fill_manual(values = c(white = "white", grey = band_fill_grey)) +
+  # Vertical gridlines only, drawn above the bands but below the data
+  geom_vline(xintercept = growth_x_breaks, color = gridline_color, linewidth = 0.5) +
+  # IPCC 95% CI band: light grey, rounded ends, behind the IPCC mean line and GROA bars
+  geom_segment(
+    data = ipcc_growth_df,
+    aes(x = ci_lower, xend = ci_upper, y = y_pos, yend = y_pos),
+    color = ipcc_ci_grey, lineend = "round", linewidth = 3.5
+  ) +
+  geom_segment(
+    data = ipcc_growth_df,
+    aes(x = ipcc_val, xend = ipcc_val, y = y_bottom, yend = y_top, color = label),
+    lineend = "butt", linewidth = 1.3, key_glyph = draw_key_ipcc
+  ) +
+  geom_segment(
+    data = groa_growth_df %>% filter(!is.na(ci_lower)),
+    aes(x = ci_lower, xend = ci_upper, y = y, yend = y, color = label),
+    lineend = "round", linewidth = 3.5, alpha = 0.85
+  ) +
+  geom_point(
+    data = groa_growth_df,
+    aes(x = mean_val, y = y, color = label),
+    size = 1.6, shape = 21, fill = "white", stroke = 0
+  ) +
+  facet_grid(climate_region ~ ., scales = "free_y", space = "free_y", labeller = region_labeller) +
+  scale_x_continuous(breaks = growth_x_breaks, limits = c(0, NA),
+                     expand = expansion(mult = c(0, 0.05))) +
+  y_scale_growth +
+  scale_color_manual(values = color_vals, breaks = label_order) +
+  guides(color = guide_legend(title = NULL)) +
+  labs(x = expression(AGC~accumulation~rate~(Mg~ha^{-1}~yr^{-1})), y = NULL) +
+  theme_bw() +
+  theme(
+    strip.text.y      = element_text(angle = 0, face = "bold"),
+    strip.background  = element_rect(fill = ecozone_grey, color = panel_border_color,
+                                      linewidth = panel_border_width),
+    panel.spacing.y   = unit(0.6, "lines"),
+    panel.grid        = element_blank(),
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    legend.position   = "none"
+  )
+
+# panel — use guide_area() to anchor the shared legend at the bottom
+panel_plot <- p_maturity + p_growth + guide_area() +
+  plot_layout(
+    guides  = "collect",
+    design  = "AB\nCC",
+    widths  = c(1.3, 1),
+    heights = c(10, 1)
+  )
+
+panel_plot
+
+ggsave(here("output", "figures", "groa_vs_ipcc_c_stock_growth_panel.png"), panel_plot,
+       width = 9, height = 10, dpi = 300, bg = "white")
+```
+
+
+Compare three estimates of the annual carbon accumulation rate for each climate region x agroforestry category partition with a successful Chapman-Richards fit (filtered tables from notebook 08): the fitted-curve growth rate (mean annual increment to 90% of maturity, bootstrap 95% CI), the observed mean of the plot-level annual change rates (t-based 95% CI), and, for AGC, the IPCC Tier 1 default (95% CI from Table 5.1). IPCC values are for Tropical/subtropical and Temperate as a whole, so the same value is shown in the wet, dry and combined panels. IPCC partitions with no fitted curve (e.g. parklands, boundary plantings) are added to the combined Tropical/subtropical or Temperate panel, with the observed rate where the full fit table has one from at least 15 rate records. IPCC Table 5.1 gives no agroforestry SOC rates, so the ΔSOC figure compares only the curve and observed rates.
+```{r rate-comparison, fig.width = 7, fig.height = 8}
+plot_rate_comparison <- function(table_file, x_lab, ipcc = NULL) {
+  method_cols <- c(
+    "Chapman-Richards curve (mean annual increment to 90% of maturity)" = "#0072B2",
+    "Observed (mean of plot-level annual rates)" = "#E69F00",
+    "IPCC (2019) Tier 1 default" = "black")
+  col_left  <- c("Tropical/subtropical wet", "Tropical/subtropical dry", "Tropical/subtropical all")
+  col_right <- c("Temperate wet", "Temperate dry", "Temperate all", "Boreal/polar", "All ecoregions")
+
+  tbl <- read_cr_table(table_file, sep.names = " ")
+  rates <- bind_rows(
+    tbl |> transmute(Region, af_cat = `AF category`, method = names(method_cols)[1],
+                     est = `Growth rate (Mg C ha-1 yr-1)`,
+                     lwr = `Growth rate 95% CI lower`, upr = `Growth rate 95% CI upper`),
+    tbl |> transmute(Region, af_cat = `AF category`, method = names(method_cols)[2],
+                     est = `Mean (Mg C ha-1 yr-1)`, lwr = `95% CI lower`, upr = `95% CI upper`)
+  )
+  if (!is.null(ipcc)) {
+    # IPCC CI is a symmetric +/- percent of the mean
+    ipcc_long <- ipcc |>
+      transmute(reg, af_cat, method = names(method_cols)[3], est = c_t_ha_yr,
+                lwr = c_t_ha_yr * (1 - c_t_ha_yr_95_ci / 100),
+                upr = c_t_ha_yr * (1 + c_t_ha_yr_95_ci / 100))
+    shown <- tbl |>
+      distinct(Region, af_cat = `AF category`) |>
+      mutate(reg = str_extract(Region, "^(Tropical/subtropical|Temperate)"))
+    # IPCC value next to every fitted partition in the matching IPCC region
+    ipcc_rates <- shown |>
+      inner_join(ipcc_long, by = c("reg", "af_cat")) |>
+      select(-reg)
+    # IPCC partitions without a fitted curve go in the combined-region panel
+    # (the scope IPCC describes), with the observed rate from the full table
+    # where it rests on >= 15 rate records (the minimum n used for the fits)
+    ipcc_extra <- ipcc_long |>
+      mutate(Region = paste(reg, "all")) |>
+      anti_join(shown, by = c("Region", "af_cat")) |>
+      select(-reg)
+    full_tbl <- read_cr_table(sub("_filtered", "", table_file), sep.names = " ")
+    obs_extra <- full_tbl |>
+      semi_join(ipcc_extra, by = c("Region", "AF category" = "af_cat")) |>
+      filter(`n (rates)` >= 15) |>
+      transmute(Region, af_cat = `AF category`, method = names(method_cols)[2],
+                est = `Mean (Mg C ha-1 yr-1)`, lwr = `95% CI lower`, upr = `95% CI upper`)
+    rates <- bind_rows(rates, ipcc_rates, ipcc_extra, obs_extra)
+  }
+  method_cols <- method_cols[names(method_cols) %in% rates$method]
+
+  rates <- rates |>
+    mutate(af_cat = if_else(af_cat == "All AF categories", "All categories",
+                            coalesce(af_cat_labels[af_cat], af_cat)))
+  cat_levels <- rev(c(sort(setdiff(unique(rates$af_cat), "All categories")), "All categories"))
+  rates <- rates |>
+    mutate(af_cat = factor(af_cat, levels = cat_levels),
+           method = factor(method, levels = names(method_cols)))
+  x_lims <- range(c(0, rates$lwr, rates$upr), na.rm = TRUE)
+
+  # Legend keys are only drawn for methods present in a panel, so take the
+  # legend from the first panel that has every method
+  regs_present <- intersect(c(col_left, col_right), rates$Region)
+  legend_reg <- regs_present[map_lgl(regs_present, \(r)
+    n_distinct(rates$method[rates$Region == r]) == length(method_cols))][1]
+
+  region_panel <- function(reg) {
+    ggplot(filter(rates, Region == reg), aes(x = est, y = af_cat, color = method)) +
+      geom_vline(xintercept = 0, linewidth = 0.3, color = "grey60") +
+      geom_linerange(aes(xmin = lwr, xmax = upr), linewidth = 0.45,
+                     position = position_dodge(width = 0.75)) +
+      geom_point(size = 1.2, position = position_dodge(width = 0.75)) +
+      facet_wrap(~Region) +
+      scale_x_continuous(limits = x_lims, expand = expansion(mult = 0.02)) +
+      scale_color_manual(values = method_cols,
+                         guide = if (identical(reg, legend_reg)) guide_legend(ncol = 1) else "none") +
+      labs(x = NULL, y = NULL, color = NULL) +
+      theme_bw(base_size = 8) +
+      theme(panel.grid.major.y = element_blank(),
+            panel.grid.minor   = element_blank(),
+            strip.background   = element_rect(fill = "grey92"),
+            strip.text         = element_text(face = "bold"),
+            axis.text          = element_text(color = "black"),
+            legend.key.height  = unit(0.8, "lines"),
+            legend.text        = element_text(size = 8))
+  }
+  # Panel heights proportional to the number of categories in each region
+  region_column <- function(regs) {
+    regs <- regs[regs %in% rates$Region]
+    n_rows <- map_int(regs, \(r) n_distinct(rates$af_cat[rates$Region == r]))
+    wrap_plots(map(regs, region_panel), ncol = 1, heights = n_rows + 1.2)
+  }
+  x_title <- wrap_elements(full = grid::textGrob(x_lab, gp = grid::gpar(fontsize = 9)))
+  wrap_plots(A = region_column(col_left), B = region_column(col_right),
+             D = x_title, C = guide_area(),
+             design = "AB\nDD\nCC", heights = c(20, 0.6, 0.4 + 0.5 * length(method_cols))) +
+    plot_layout(guides = "collect")
+}
+
+agc_rate_plot <- plot_rate_comparison(
+  here("output", "tables", "agc_cr_fit_table_filtered.xlsx"),
+  x_lab = expression(AGC~accumulation~rate~(Mg~C~ha^{-1}~yr^{-1})),
+  ipcc = ipcc_df
+)
+agc_rate_plot
+ggsave(here("output", "figures", "agc_rate_comparison_by_method.png"), agc_rate_plot,
+       width = 7, height = 8.5, dpi = 600, bg = "white")
+```
+
+```{r rate-comparison-soc, fig.width = 7, fig.height = 6}
+soc_rate_plot <- plot_rate_comparison(
+  here("output", "tables", "soc_cr_fit_table_filtered.xlsx"),
+  x_lab = expression(Delta*SOC~accumulation~rate~(Mg~C~ha^{-1}~yr^{-1}))
+)
+soc_rate_plot
+ggsave(here("output", "figures", "soc_delta_rate_comparison_by_method.png"), soc_rate_plot,
+       width = 7, height = 6, dpi = 600, bg = "white")
+```

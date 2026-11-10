@@ -1,0 +1,257 @@
+---
+title: "04 - Post-process and drop outliers from plot-level carbon data"
+output: html_document
+---
+
+**Purpose.** Loads the six covariate-joined carbon datasets (AGC, BGC and SOC
+stock and change) and post-processes them for analysis: adds "unknown" (or,
+for the SOC control category, "chrono") dummy columns for rows with no dummy
+category, drops outliers in the response variable using Tukey IQR fences
+(k = 1.5), drops rows with stand age of 0, and drops binary predictor columns
+with only one unique non-NA value. Histograms of the response before and after
+filtering are shown. The outputs are the final analysis datasets used by notebooks
+06-11.
+
+**Inputs.**
+
+- `output/data/agc_by_plot_and_age_w_covars.xlsx` (03a)
+- `output/data/bgc_by_plot_and_age_w_covars.xlsx` (03a)
+- `output/data/soc_by_plot_and_age_w_covars.xlsx` (03a)
+- `output/data/agc_change_by_plot_and_age_w_covars.xlsx` (03b)
+- `output/data/bgc_change_by_plot_and_age_w_covars.xlsx` (03b)
+- `output/data/soc_change_by_plot_and_age_w_covars.xlsx` (03b)
+
+**Outputs.**
+
+- `output/data/<c_data_name>_by_plot_and_age_w_covars_drop_outliers.xlsx`
+  for each of `agc`, `bgc`, `soc`, `agc_change`, `bgc_change`, `soc_change`
+
+```{r setup}
+
+library(here)
+library(tidyverse)
+library(openxlsx)
+
+```
+
+Load the covariate-joined carbon datasets.
+```{r load-data}
+
+agc_df <- read.xlsx(here("output", "data", "agc_by_plot_and_age_w_covars.xlsx"))
+agc_change_df <- read.xlsx(here("output", "data", "agc_change_by_plot_and_age_w_covars.xlsx"))
+bgc_df <- read.xlsx(here("output", "data", "bgc_by_plot_and_age_w_covars.xlsx"))
+bgc_change_df <- read.xlsx(here("output", "data", "bgc_change_by_plot_and_age_w_covars.xlsx"))
+soc_df <- read.xlsx(here("output", "data", "soc_by_plot_and_age_w_covars.xlsx"))
+soc_change_df <- read.xlsx(here("output", "data", "soc_change_by_plot_and_age_w_covars.xlsx"))
+
+```
+
+
+Options: the datasets to process.
+```{r options}
+
+c_data_names <- c('agc', 'bgc', 'soc', 'agc_change', 'bgc_change', 'soc_change')
+
+```
+
+Define the binary predictor variables and dummy-variable column prefixes.
+```{r var-groups}
+
+bin_vars <- c('pruning', 'weed_control', 'tillage', 'pest_control', 'burning', 
+              'litter_management', 'fertilizer', 'irrigation', 'grazing',
+              'n_fix_bin', 'myco_fungi_am', 'myco_fungi_ecm', 
+              'freezing_exposed', 'resprout_after_fire')
+
+# plus af_cat, prior_*, soil_tex_*, ctrl_*
+
+dummy_var_prefs <- c('prior_', 'soil_tex_', 'ctrl_')
+
+
+```
+
+
+Add a dummy column flagging rows with no category for each dummy-variable group (`<prefix>unknown`, or `ctrl_chrono` for the SOC control category).
+```{r unknown-dummies}
+
+for (c_data_name in c_data_names) {
+  for (dummy_var_pref in dummy_var_prefs) {
+    my_c_data <- get(paste0(c_data_name, '_df'))
+    if (any(grepl(dummy_var_pref, names(my_c_data)))) {
+      my_c_data <- my_c_data %>%
+        rowwise() %>%
+        mutate(my_dummy_rowsum = sum(c_across(starts_with(dummy_var_pref) & where(is.numeric)), na.rm = TRUE))
+      if (dummy_var_pref == 'ctrl_') { # for soc_change, no 'ctrl' means it was part of a chronosequence
+        my_c_data <- my_c_data %>%
+          rowwise() %>%
+          mutate(!!sym(paste0(dummy_var_pref, 'chrono')) := ifelse(my_dummy_rowsum == 0, 1, NA)) %>%
+          dplyr::select(-my_dummy_rowsum)
+      } else {
+        my_c_data <- my_c_data %>%
+          rowwise() %>%
+          mutate(!!sym(paste0(dummy_var_pref, 'unknown')) := ifelse(my_dummy_rowsum == 0, 1, NA)) %>%
+          dplyr::select(-my_dummy_rowsum)
+      }
+      assign(paste0(c_data_name, '_df'), my_c_data)
+    }
+  }
+}
+
+
+```
+
+
+Histograms of the response variable before filtering (`c_t_ha` for stocks, `c_t_ha_delta` for SOC stock, `c_t_ha_yr` for change).
+```{r hist-before}
+
+for (c_data_name in c_data_names) {
+  if(grepl('change', c_data_name)) {
+    var_name <- 'c_t_ha_yr'
+  } else if (c_data_name == 'soc') {
+    var_name <- 'c_t_ha_delta'
+  } else {
+    var_name <- 'c_t_ha'
+  }
+  
+  plot_obj <- get(paste0(c_data_name, '_df')) %>%
+    ggplot(aes(x = !!sym(var_name))) +
+    geom_histogram(bins = 30, fill = "gray", color = "black", alpha = 0.8) +
+    labs(title = c_data_name) +
+    theme_minimal(base_size = 14)
+  
+  print(plot_obj)
+}
+
+
+```
+
+Drop rows whose response value falls outside the Tukey IQR fences.
+
+```{r drop-outliers}
+
+# filter out values more than k * IQR beyond Q1/Q3 (Tukey-style fences)
+# k = 1.5 is the conventional Tukey "outlier" fence; k = 1 was tried first to
+# approximate the stringency of the previous 2-SD rule under normality, but
+# empirically dropped 5-17% more rows than the 2-SD rule across datasets, so
+# k = 1.5 was adopted instead as the more standard, less aggressive choice
+# drop_rows argument specifies whether to drop the whole row, or just replace the outliers with NA
+# lower fence is intentionally not clamped at 0, even for non-negative variables
+toss_outliers_iqr <- function(c_data_name, var_name, drop_rows = T, k = 1.5) {
+  
+  df <- get(paste0(c_data_name, '_df'))
+  
+  # calculate IQR fences
+  q1 <- quantile(df[[var_name]], 0.25, na.rm = T)
+  q3 <- quantile(df[[var_name]], 0.75, na.rm = T)
+  iqr_val <- q3 - q1
+  low_lim <- q1 - k * iqr_val
+  high_lim <- q3 + k * iqr_val
+  
+  print(paste0('Filtering out ', c_data_name, '$', var_name, ' outliers below ', low_lim, ' and above ', high_lim))
+  
+  
+  if (drop_rows) {
+    df_filt <- df %>%
+      filter(
+        !!sym(var_name) > low_lim,
+        !!sym(var_name) < high_lim
+      )
+  } else {
+    df_filt <- df %>%
+      mutate(!!sym(var_name) := ifelse((!!sym(var_name) > low_lim) & 
+                                         (!!sym(var_name) < high_lim),
+                                       !!sym(var_name), NA))
+  }
+  
+  return (df_filt)
+}
+
+for (c_data_name in c_data_names) {
+  if(grepl('change', c_data_name)) {
+    var_name <- 'c_t_ha_yr'
+  } else if (c_data_name == 'soc') {
+    var_name <- 'c_t_ha_delta'
+  } else {
+    var_name <- 'c_t_ha'
+  }
+  
+  assign(paste0(c_data_name, '_df'), toss_outliers_iqr(c_data_name, var_name))
+}
+
+```
+
+Drop rows with stand age of 0 (`age_mean` for change datasets, `age` for stock datasets).
+```{r drop-age-0}
+
+for (c_data_name in c_data_names) {
+  if(grepl('change', c_data_name)) {
+    age_var_name <- 'age_mean'
+  } else {
+    age_var_name <- 'age'
+  }
+  
+  assign(paste0(c_data_name, '_df'), get(paste0(c_data_name, '_df')) %>%
+           filter(!!sym(age_var_name) > 0))
+}
+
+```
+
+
+Drop binary columns with only one unique non-NA value.
+```{r drop-constant-bin}
+
+for (c_data_name in c_data_names) {
+  
+  my_c_df <- get(paste0(c_data_name, '_df'))
+  
+  to_drop <- bin_vars[
+    vapply(my_c_df[bin_vars],
+           function(x) dplyr::n_distinct(x, na.rm = TRUE) <= 1,
+           logical(1))
+  ]
+  
+  print(paste0("Dropped binary columns with only one non-na value: ", c_data_name, ' - ', to_drop))
+  
+  my_c_df <- my_c_df %>%
+    dplyr::select(-any_of(to_drop))
+  
+  assign(paste0(c_data_name, '_df'), my_c_df)
+}
+
+```
+
+
+Histograms of the response variable after filtering.
+```{r hist-after}
+
+for (c_data_name in c_data_names) {
+  if(grepl('change', c_data_name)) {
+    var_name <- 'c_t_ha_yr'
+  } else if (c_data_name == 'soc') {
+    var_name <- 'c_t_ha_delta'
+  } else {
+    var_name <- 'c_t_ha'
+  }
+  
+  plot_obj <- get(paste0(c_data_name, '_df')) %>%
+    ggplot(aes(x = !!sym(var_name))) +
+    geom_histogram(bins = 30, fill = "gray", color = "black", alpha = 0.8) +
+    labs(title = c_data_name) +
+    theme_minimal(base_size = 14)
+  
+  print(plot_obj)
+}
+
+
+```
+
+
+Save the filtered datasets.
+```{r save}
+
+for (c_data_name in c_data_names) {
+  write.xlsx(get(paste0(c_data_name, '_df')), 
+             paste0(here("output", "data"), "/", c_data_name, '_by_plot_and_age_w_covars_drop_outliers.xlsx'))
+}
+
+
+```
